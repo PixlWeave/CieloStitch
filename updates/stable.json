@@ -1,7 +1,7 @@
 {
   "_comment": "CieloStitch update manifest. Host this file at https://www.cielostitch.com/updates/stable.json",
   "version": "0.3.61",
-  "release_page": "https://github.com/dc-saha/CieloStitch/releases/tag/v0.3.60",
-  "release_notes": "https://github.com/dc-saha/CieloStitch/releases/tag/v0.3.60",
-  "download_url": "https://github.com/dc-saha/CieloStitch/releases/download/v0.3.60/CieloStitch-v0.3.60-win64-portable.zip"
+  "release_page": "https://github.com/dc-saha/CieloStitch/releases/tag/v0.3.61",
+  "release_notes": "https://github.com/dc-saha/CieloStitch/releases/tag/v0.3.61",
+  "download_url": "https://github.com/dc-saha/CieloStitch/releases/download/v0.3.61/CieloStitch-v0.3.61-win64-portable.zip"
 }
