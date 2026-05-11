@@ -1,2 +1,0 @@
-[console_scripts]
-cielostitch-cli = cielostitch_core.cli:main
