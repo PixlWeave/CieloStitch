@@ -27,3 +27,9 @@ pip-wheel-metadata/
 
 Thumbs.db
 Desktop.ini
+
+# Jekyll local build artifacts
+_site/
+.jekyll-cache/
+.jekyll-metadata
+Gemfile.lock
