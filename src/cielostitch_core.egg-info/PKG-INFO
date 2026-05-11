@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: cielostitch-core
+Version: 0.4.40
+Summary: Core stitching engine for CieloStitch
+License-Expression: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy==2.4.2
+Requires-Dist: opencv-python-headless
+Requires-Dist: packaging==26.0
+Requires-Dist: tifffile==2026.2.20
+Requires-Dist: astropy
+Requires-Dist: xisf
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: pytest-cov>=5; extra == "dev"
+Dynamic: license-file
