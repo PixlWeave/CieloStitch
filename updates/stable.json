@@ -1,7 +1,0 @@
-{
-  "_comment": "CieloStitch update manifest. Host this file at https://www.cielostitch.com/updates/stable.json",
-  "version": "0.4.50",
-  "release_page": "https://github.com/PixlWeave/CieloStitch/releases/tag/v0.4.50",
-  "release_notes": "https://github.com/PixlWeave/CieloStitch/releases/tag/v0.4.50",
-  "download_url": "https://github.com/PixlWeave/CieloStitch/releases/download/v0.4.50/CieloStitch-Setup-v0.4.50-win64.exe"
-}
