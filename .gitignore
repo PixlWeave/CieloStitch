@@ -30,6 +30,7 @@ Desktop.ini
 
 # Jekyll local build artifacts
 _site/
-.jekyll-cache/
+_delete/
+_delete/.jekyll-cache/
 .jekyll-metadata
-Gemfile.lock
+_delete/Gemfile.lock
