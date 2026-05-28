@@ -289,8 +289,10 @@ def read_image(path: str, alpha_policy: str = "auto"):
         if data.ndim == 3:
             # h, w, c = None, None, None
             arr = data
-            # Channels-first (C,H,W) -> move channels to last
-            if arr.shape[0] in (3, 4) and arr.shape[1] > 1 and arr.shape[2] > 1:
+            # Channels-first (C,H,W) -> move channels to last.
+            # Require H and W both strictly larger than C so we don't
+            # misidentify a channels-last image whose height happens to be 3 or 4.
+            if arr.shape[0] in (3, 4) and arr.shape[1] > arr.shape[0] and arr.shape[2] > arr.shape[0]:
                 arr = np.moveaxis(arr, 0, -1)
             # Now expect channels-last
             if arr.shape[-1] in (3, 4):

@@ -35,7 +35,9 @@ from ..config.constants import (
     SCAN_ORDERS, START_CORNERS, ALTERNATING, BLEND_TYPES,
     MOUNT_PRECISIONS, GAIN_COMPENSATION_OPTIONS, SIMPLE_GAIN_METHODS,
     SEEING_CONDITIONS, SEAMLESS_OPTIONS, MAX_MULTIBAND_LEVELS,
+    PROJECTION_MODES, TRANSFORM_MODES, BUNDLE_ADJUSTMENT_MODES, FPX_MODES,
     SESSION_GRID_COLS_MIN, SESSION_GRID_COLS_MAX, EDGE_AWARE_TYPES,
+    SIMPLE_ENGINE_MODES,
 )
 
 
@@ -50,6 +52,45 @@ PROFILE_CLASSES: Dict[str, Any] = {
     "general": GeneralProfile,
 }
 
+simple_engine: ASectionDef = \
+    (
+        "Simple Engine, session.svg",
+        [
+            {
+                "name": "simple_transform_mode", "label": "Simple transform", "type": "enum",
+                "choices": SIMPLE_ENGINE_MODES,
+            },
+            {
+                "name": "simple_confidence_threshold", "label": "Confidence threshold", "type": "double",
+                "min": 0.0, "max": 1.0, "step": 0.05, "decimals": 2,
+            },
+            {
+                "name": "simple_registration_resol_mp", "label": "Registration res. (MP)", "type": "double",
+                "min": -1.0, "max": 50.0, "step": 0.1, "decimals": 1,
+            },
+            {
+                "name": "simple_seam_estimation_resol_mp", "label": "Seam res. (MP)", "type": "double",
+                "min": -1.0, "max": 50.0, "step": 0.1, "decimals": 1,
+            },
+            {
+                "name": "simple_compositing_resol_mp", "label": "Compositing res. (MP)", "type": "double",
+                "min": -1.0, "max": 100.0, "step": 0.1, "decimals": 1,
+            },
+            {
+                "name": "simple_wave_correction", "label": "Wave correction", "type": "bool",
+            },
+            {
+                "name": "simple_scans_retry", "label": "Retry with SCANS", "type": "bool",
+                "depends_on": {"field": "simple_transform_mode", "value": "scans", "negate": True},
+            },
+            {
+                "name": "simple_engine_timeout_sec", "label": "Timeout (s)", "type": "int",
+                "min": 0, "max": 86400, "step": 30,
+            },
+        ],
+        {"depends_on": {"context": "engine", "value": "simple"}},
+    )
+
 grid: ASectionDef = \
     (
         "Capture Grid, session.svg",
@@ -59,12 +100,12 @@ grid: ASectionDef = \
                 "min": SESSION_GRID_COLS_MIN, "max": SESSION_GRID_COLS_MAX,
             },
             {
-                "name": "scan_order", "label": "Scan Order", "type": "enum",
+                "name": "scan_order", "label": "Scan order", "type": "enum",
                 "choices": SCAN_ORDERS,
                 "depends_on": {"field": "stitch_mode", "values": GRID_MODES},
             },
             {
-                "name": "start_corner", "label": "Start Corner", "type": "enum",
+                "name": "start_corner", "label": "Start corner", "type": "enum",
                 "choices": START_CORNERS,
                 "depends_on": {"field": "stitch_mode", "values": GRID_MODES},
             },
@@ -74,7 +115,7 @@ grid: ASectionDef = \
                 "depends_on": {"field": "stitch_mode", "values": GRID_MODES},
             },
             {
-                "name": "scan_icon_label", "label": "Scan Pattern", "type": "thumb",
+                "name": "scan_icon_label", "label": "Scan pattern", "type": "thumb",
                 "depends_on": {"field": "stitch_mode", "values": GRID_MODES},
             },
             {
@@ -90,7 +131,12 @@ grid: ASectionDef = \
             {
                 "name": "staged_matching_mode", "label": "Staged mode", "type": "enum",
                 "choices": ["auto", "disabled", "manual"],
-                "depends_on": {"field": "stitch_mode", "value": "freeform"},
+                "depends_on": {
+                    "all": [
+                        {"field": "stitch_mode", "value": "freeform"},
+                        {"context": "developer_mode", "value": True},
+                    ],
+                },
             },
             {
                 "name": "refs_per_stage", "label": "Refs per stage", "type": "int",
@@ -99,10 +145,12 @@ grid: ASectionDef = \
                     "all": [
                         {"field": "staged_matching_mode", "value": "manual"},
                         {"field": "stitch_mode", "value": "freeform"},
+                        {"context": "developer_mode", "value": True},
                     ],
                 },
             },
         ],
+        # {"depends_on": {"context": "engine", "value": "simple", "negate": True}},
     )
 
 session: ASectionDef = \
@@ -110,17 +158,72 @@ session: ASectionDef = \
         "Capture Session, session.svg",
         [
             {
-                "name": "mount_precision", "label": "Mount Precision", "type": "enum",
+                "name": "mount_precision", "label": "Mount precision", "type": "enum",
                 "choices": MOUNT_PRECISIONS,
             },
             {
-                "name": "seeing", "label": "Seeing Condition", "type": "enum",
+                "name": "seeing", "label": "Seeing condition", "type": "enum",
                 "choices": SEEING_CONDITIONS,
+            },
+            {
+                "name": "projection_mode", "label": "🌐 Projection mode", "type": "enum",
+                "choices": PROJECTION_MODES,
+            },
+            {
+                "name": "fpx_mode", "label": "Lens info source", "type": "enum",
+                "choices": FPX_MODES,
+                # "depends_on": {"field": "projection_mode", "value": "native", "negate": True},
+            },
+            {
+                "name": "focal_length_mm", "label": "Focal length (mm)", "type": "double",
+                "min": 0.0, "max": 6000.0, "step": 0.1, "decimals": 2,
+                "depends_on": {"all": [
+                    # {"field": "projection_mode", "value": "native", "negate": True},
+                    {"field": "fpx_mode", "value": "camera"},
+                ]},
+            },
+            {
+                "name": "sensor_width_mm", "label": "Sensor width (mm)", "type": "double",
+                "min": 0.0, "max": 100.0, "step": 0.1, "decimals": 2,
+                "depends_on": {"all": [
+                    # {"field": "projection_mode", "value": "native", "negate": True},
+                    {"field": "fpx_mode", "value": "camera"},
+                ]},
+            },
+            {
+                "name": "sensor_height_mm", "label": "Sensor height (mm)", "type": "double",
+                "min": 0.0, "max": 100.0, "step": 0.1, "decimals": 2,
+                "depends_on": {"all": [
+                    # {"field": "projection_mode", "value": "native", "negate": True},
+                    {"field": "fpx_mode", "value": "camera"},
+                ]},
+            },
+            {
+                "name": "hfov_deg", "label": "Horiz. FOV (deg)", "type": "double",
+                "min": 0.0, "max": 179.9, "step": 0.5, "decimals": 1,
+                "depends_on": {"all": [
+                    # {"field": "projection_mode", "value": "native", "negate": True},
+                    {"field": "fpx_mode", "value": "fov"},
+                ]},
+            },
+            {
+                "name": "fpx_factor", "label": "fpx factor (0.01–120)", "type": "double",
+                "min": 0.01, "max": 120, "step": 0.05, "decimals": 2,
+                "depends_on": {"all": [
+                    # {"field": "projection_mode", "value": "native", "negate": True},
+                    {"field": "fpx_mode", "value": "factor"},
+                ]},
+            },
+            {
+                "name": "camera_angle_deg", "label": "Camera angle (deg)", "type": "double",
+                "min": -360.0, "max": 360.0, "step": 1.0, "decimals": 1,
+                # "depends_on": {"field": "projection_mode", "value": "native", "negate": True},
             },
         ],
         {"depends_on": {"all":[
             {"field": "stitch_mode", "value": "zero-overlap", "negate": True},
             {"field": "stitch_mode", "value": "auto", "negate": True},
+            # {"context": "engine", "value": "simple", "negate": True},
         ],},},
     )
 
@@ -129,7 +232,7 @@ blending: ASectionDef = \
         "Blending, profile.svg",
         [
             {
-                "name": "blend_type", "label": "Blend type", "type": "enum",
+                "name": "blend_type", "label": "🔀 Blend type", "type": "enum",
                 "choices": BLEND_TYPES,
             },
             {
@@ -165,6 +268,7 @@ blending: ASectionDef = \
                     "all": [
                         {"context": "advanced_mode", "value": True},
                         {"field": "blend_type", "value": "adaptive-multiband"},
+                        {"context": "developer_mode", "value": True},
                     ],
                 }
             },
@@ -176,6 +280,7 @@ blending: ASectionDef = \
                     "all": [
                         {"context": "advanced_mode", "value": True},
                         {"field": "blend_type", "value": "adaptive-multiband"},
+                        {"context": "developer_mode", "value": True},
                     ],
                 }
             },
@@ -186,6 +291,42 @@ blending: ASectionDef = \
                     "all": [
                         {"context": "advanced_mode", "value": True},
                         {"field": "blend_type", "value": "adaptive-multiband"},
+                        {"context": "developer_mode", "value": True},
+                    ],
+                }
+            },
+            {
+                "name": "ghost_guard_enabled", "label": "Ghosting guard",
+                "type": "bool",
+                "depends_on": {
+                    "all": [
+                        {"context": "advanced_mode", "value": True},
+                        {"field": "blend_type", "values": ["feather", "adaptive-feather", "multiband", "adaptive-multiband", "seamless"]},
+                    ],
+                }
+            },
+            {
+                "name": "ghost_guard_risk_threshold", "label": "Ghost risk threshold",
+                "type": "double", "min": 0.00, "max": 1.00,
+                "step": 0.05, "decimals": 2,
+                "depends_on": {
+                    "all": [
+                        {"context": "advanced_mode", "value": True},
+                        {"field": "blend_type", "values": ["feather", "adaptive-feather", "multiband", "adaptive-multiband", "seamless"]},
+                        {"field": "ghost_guard_enabled", "value": True},
+                        {"context": "developer_mode", "value": True},
+                    ],
+                }
+            },
+            {
+                "name": "ghost_guard_feather_px", "label": "Ghost seam feather (px)",
+                "type": "int", "min": 5, "max": 200, "step": 1,
+                "depends_on": {
+                    "all": [
+                        {"context": "advanced_mode", "value": True},
+                        {"field": "blend_type", "values": ["feather", "adaptive-feather", "multiband", "adaptive-multiband", "seamless"]},
+                        {"field": "ghost_guard_enabled", "value": True},
+                        {"context": "developer_mode", "value": True},
                     ],
                 }
             },
@@ -196,6 +337,7 @@ blending: ASectionDef = \
                     "all": [
                         {"context": "advanced_mode", "value": True},
                         {"field": "blend_type", "value": "none", "negate": True},
+                        {"context": "developer_mode", "value": True},
                     ],
                 }
             },
@@ -206,6 +348,7 @@ blending: ASectionDef = \
                     "all": [
                         {"context": "advanced_mode", "value": True},
                         {"field": "blend_type", "value": "none", "negate": True},
+                        {"context": "developer_mode", "value": True},
                     ],
                 }
             },
@@ -213,6 +356,7 @@ blending: ASectionDef = \
         {"depends_on": {"all":[
             {"field": "stitch_mode", "value": "zero-overlap", "negate": True},
             {"field": "stitch_mode", "value": "auto", "negate": True},
+            # {"context": "engine", "value": "simple", "negate": True},
         ],},},
     )
 
@@ -227,7 +371,12 @@ gain: ASectionDef = \
             {
                 "name": "local_gain_tile_size", "label": "Local gain tile size", "type": "int",
                 "min": 16, "max": 512, "step": 16,
-                "depends_on": {"field": "gain_compensation", "value": "local"},
+                "depends_on": {
+                    "all": [
+                        {"field": "gain_compensation", "value": "local"},
+                        {"context": "developer_mode", "value": True},
+                    ],
+                },
             },
             {
                 "name": "gain_method", "label": "Simple gain method",
@@ -253,6 +402,7 @@ gain: ASectionDef = \
         {"depends_on": {"all":[
             {"field": "stitch_mode", "value": "zero-overlap", "negate": True},
             {"field": "stitch_mode", "value": "auto", "negate": True},
+            # {"context": "engine", "value": "cielo"},
         ],},},
     )
 # advanced
@@ -277,7 +427,10 @@ feature_detection: ASectionDef = \
                 "depends_on": {"field": "stitch_mode", "values": UNKNOWN_OVERLAP_MODES},
             },
         ],
-        {"depends_on": {"field": "stitch_mode", "value": "auto", "negate": True}},
+        {"depends_on": {"all": [
+            {"field": "stitch_mode", "value": "auto", "negate": True},
+            # {"context": "engine", "value": "simple", "negate": True},
+        ]}},
     )
 
 feature_matching: ASectionDef = \
@@ -303,18 +456,47 @@ feature_matching: ASectionDef = \
                 "name": "min_inliers", "label": "Min good matches", "type": "int", "min": 4, "max": 64, "step": 1,
                 "depends_on": {"field": "stitch_mode", "values": UNKNOWN_OVERLAP_MODES},
             },
+            # {
+            #     "name": "transform_mode", "label": "🔄 Transform mode", "type": "enum",
+            #     "choices": TRANSFORM_MODES,
+            #     # "help": "Controls the geometric model for feature matching: 'auto' (profile default),
+            #     # 'affine' (rotation/scale), 'homography' (perspective, best for wide/pano), or 'translation' (shift only).",
+            #     "depends_on": {"field": "stitch_mode", "values": UNKNOWN_OVERLAP_MODES},
+            # },
+        ],
+        {"depends_on": {"all": [
+            {"field": "stitch_mode", "value": "auto", "negate": True},
+            # {"context": "engine", "value": "simple", "negate": True},
+        ]}},
+    )
+
+transform: ASectionDef = \
+    (
+        "Transformation, profile.svg",
+        [
             {
-                "name": "lock_rotation", "label": "Lock rotation", "type": "bool",
+                "name": "transform_mode", "label": "🔄 Transform mode", "type": "enum",
+                "choices": TRANSFORM_MODES,
+                # "help": "Controls the geometric model for feature matching: 'auto' (profile default),
+                # 'affine' (rotation/scale), 'homography' (perspective, best for wide/pano), or 'translation' (shift only).",
                 "depends_on": {"field": "stitch_mode", "values": UNKNOWN_OVERLAP_MODES},
             },
         ],
-        {"depends_on": {"field": "stitch_mode", "value": "auto", "negate": True}},
+        {"depends_on": {"all": [
+            {"field": "stitch_mode", "value": "auto", "negate": True},
+            # {"context": "engine", "value": "simple", "negate": True},
+        ]}},
     )
 
 grid_fallback: ASectionDef = \
     (
         "Grid Fallback, session.svg",
         [
+            {
+                "name": "bundle_adjustment_mode", "label": "Bundle adjustment", "type": "enum",
+                "choices": BUNDLE_ADJUSTMENT_MODES,
+                "depends_on": {"field": "stitch_mode", "values": UNKNOWN_OVERLAP_MODES},
+            },
             {
                 "name": "enable_grid_phase_fallback", "label": "Phase fallback", "type": "bool",
                 "depends_on": {"field": "stitch_mode", "values": UNKNOWN_OVERLAP_MODES},
@@ -325,15 +507,23 @@ grid_fallback: ASectionDef = \
             },
             {
                 "name": "enable_grid_nominal_fallback", "label": "Nominal fallback", "type": "bool",
-                "depends_on": {"field": "stitch_mode", "values": UNKNOWN_OVERLAP_MODES},
+                "depends_on": {
+                    "all": [
+                        {"field": "stitch_mode", "values": UNKNOWN_OVERLAP_MODES},
+                        {"context": "developer_mode", "value": True},
+                    ],
+                },
             },
         ],
-        {"depends_on": {"field": "stitch_mode", "value": "auto", "negate": True}},
+        {"depends_on": {"all": [
+            {"field": "stitch_mode", "value": "auto", "negate": True},
+            # {"context": "engine", "value": "simple", "negate": True},
+        ]}},
     )
 
 
 def _all_basic_field_groups() -> ASectionDefs:
-    return [blending, grid, session]
+    return [simple_engine, blending, grid, session, transform]
 
 
 def _all_advanced_field_groups() -> ASectionDefs:

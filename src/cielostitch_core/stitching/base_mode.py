@@ -10,27 +10,31 @@
 import os
 import threading
 from typing import Optional
+from dataclasses import replace
 import numpy as np
 import cv2
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ...config.config import cfg
-from ...core.detector import FeatureDetector
-from ...core.matcher import FeatureMatcher
-from ...core.warper import Warper
-from ...core.blender import Blender
-from ...core.stitching.illumination import IlluminationNormalizer
-from ...core.stitching.local_gain_normalizer import LocalGainNormalizer
-from ...core.feature_cache import (
+from cielostitch_core.config.config import cfg
+from cielostitch_core.core.detector import FeatureDetector
+from cielostitch_core.core.apap import APAPConfig, APAPEstimator, APAPRegistrationResult
+from cielostitch_core.core.matcher import FeatureMatcher
+from cielostitch_core.core.warper import Warper
+from cielostitch_core.core.blender import Blender
+from cielostitch_core.stitching.illumination import IlluminationNormalizer
+from cielostitch_core.stitching.local_gain_normalizer import LocalGainNormalizer
+from cielostitch_core.core.feature_cache import (
     detect_with_cache,
     format_feature_cache_stats,
     get_feature_cache_stats,
 )
-from ...utils.message import emit_msg
-from ...state.preferences import read_pref
-from ...config.constants import MAX_MULTIBAND_LEVELS
+from cielostitch_core.utils.message import emit_msg
+from cielostitch_core.state.preferences import read_pref
+from cielostitch_core.config.constants import MAX_MULTIBAND_LEVELS
+from cielostitch_core.utils.strings import first_and_last_part
+from cielostitch_app.config.ui_constants import DISPLAY_NAME_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +70,22 @@ class BaseStitchMode:
         )
 
         # Matcher
+        _apap_config = APAPConfig(
+            mesh_cols=getattr(cfg.state.psm, "apap_mesh_cols", 16) or 16,
+            mesh_rows=getattr(cfg.state.psm, "apap_mesh_rows", 16) or 16,
+            kernel_sigma_px=float(getattr(cfg.state.psm, "apap_kernel_sigma_px", 64.0) or 64.0),
+            min_local_support=getattr(cfg.state.psm, "apap_min_local_support", 12) or 12,
+        )
         self.matcher = FeatureMatcher(
             ratio_test=profile.ratio_test,
             ransac_thresh=profile.ransac_thresh,
             min_inlier_ratio=min_inlier_ratio,
             min_inliers=min_inliers,
+            homography_max_matches=getattr(profile, "homography_max_matches", None),
+            homography_axis_growth=getattr(profile, "homography_axis_growth", None),
+            homography_linear_cond_max=getattr(profile, "homography_linear_cond_max", None),
+            homography_allow_affine_fallback=getattr(profile, "homography_allow_affine_fallback", False),
+            apap_config=_apap_config,
         )
 
         # Warper
@@ -79,7 +94,17 @@ class BaseStitchMode:
         except Exception:
             stitch_interpolator = "auto"
 
-        self.warper = Warper(interpolation=stitch_interpolator)
+        self.warper = Warper(
+            interpolation=stitch_interpolator,
+            projection_mode=getattr(cfg.state.ssm, "projection_mode", "native"),
+            focal_length_mm=getattr(cfg.state.ssm, "focal_length_mm", 0.0),
+            sensor_width_mm=getattr(cfg.state.ssm, "sensor_width_mm", 0.0),
+            sensor_height_mm=getattr(cfg.state.ssm, "sensor_height_mm", 0.0),
+            camera_angle_deg=getattr(cfg.state.ssm, "camera_angle_deg", 0.0),
+            fpx_mode=getattr(cfg.state.ssm, "fpx_mode", "factor"),
+            hfov_deg=getattr(cfg.state.ssm, "hfov_deg", 0.0),
+            fpx_factor=getattr(cfg.state.ssm, "fpx_factor", 1.5),
+        )
 
         # Blender
         self.blender = Blender(
@@ -97,79 +122,77 @@ class BaseStitchMode:
             adaptive_mb_max_boost=getattr(cfg.state.psm, "adaptive_mb_max_boost", 1),
             photometric_min_overlap_px=getattr(cfg.state.psm, "photometric_min_overlap_px", 2_000),
             photometric_full_confidence_px=getattr(cfg.state.psm, "photometric_full_confidence_px", 250_000),
+            ghost_guard_enabled=getattr(cfg.state.psm, "ghost_guard_enabled", False),
+            ghost_guard_mode=getattr(cfg.state.psm, "ghost_guard_mode", "content-aware"),
+            ghost_guard_risk_threshold=getattr(cfg.state.psm, "ghost_guard_risk_threshold", 0.55),
+            ghost_guard_feather_px=getattr(cfg.state.psm, "ghost_guard_feather_px", 80),
         )
 
         # Illumination Normalizer
         self.normalizer = IlluminationNormalizer()
 
         # Configure LocalGainNormalizer with profile-aware defaults
-        # profile_name = getattr(profile, '__class__.__name__', 'unknown').lower()
-        profile_name = type(profile).__name__.lower()
 
-        # Profile-specific local normalization parameters
-        if 'solar' in profile_name:
-            # Solar: fine tiles, adaptive lowfreq, reduced smoothing for sharpness
-            local_params = dict(
-                tile_size=48,
-                smooth_sigma=9.6,  # tile_size/5 for better edge preservation
-                gain_clamp=(0.7, 1.3),
-                use_offset=True,
-                lowfreq_sigma=None  # Adaptive: will auto-scale to ~15-20
-            )
-        elif 'lunar' in profile_name:
-            # Lunar: medium tiles, adaptive lowfreq, reduced smoothing for craters
-            local_params = dict(
-                tile_size=64,
-                smooth_sigma=12.8,  # tile_size/5 (critical for crater sharpness)
-                gain_clamp=(0.8, 1.2),
-                use_offset=True,
-                lowfreq_sigma=None  # Adaptive: will auto-scale to ~8-12
-            )
-        elif 'milky-way' in profile_name or 'nightscape' in profile_name:
-            # Deep-sky: larger tiles, adaptive lowfreq for sky gradients
-            local_params = dict(
-                tile_size=128,
-                smooth_sigma=25.6,  # tile_size/5
-                gain_clamp=(0.7, 1.3),
-                use_offset=True,
-                lowfreq_sigma=None  # Adaptive: will auto-scale to ~20-30
-            )
-        else:
-            # Default: universal adaptive settings
-            local_params = dict(
-                tile_size=128,
-                smooth_sigma=25.6,  # tile_size/5
-                gain_clamp=(0.8, 1.2),
-                use_offset=True,
-                lowfreq_sigma=None  # Adaptive based on image scale
-            )
+    @staticmethod
+    def _expand_bounds_with_apap_registration(image, bounds, registration):
+        if not isinstance(registration, APAPRegistrationResult):
+            return bounds
 
-        # Illumination Normalizer2
-        self.local_normalizer = LocalGainNormalizer(**local_params)
+        # Remember the natural content extent from compute_warp_bounds — the APAP
+        # mesh must never push the ROI outside this region, because the global
+        # homography fallback would then try to source pixels outside the panel,
+        # leaving black strips at the ROI edges.
+        natural_min_x, natural_min_y, natural_max_x, natural_max_y = [float(v) for v in bounds]
+        min_x, min_y, max_x, max_y = natural_min_x, natural_min_y, natural_max_x, natural_max_y
 
-        # Unified progress counters (used by current_summary)
-        self._progress_total = 0
-        self._progress_placed = 0
-        self._progress_skipped = 0
-        self._subpixel_refinement_keys: set = set()
-        self._placement_source_counts: dict = {
-            "anchor": 0,
-            "feature": 0,
-            "phase": 0,
-            "nominal": 0,
-            "deterministic": 0,
-        }
-        self._panel_source_by_index: dict[int, str] = {}
-        self._panel_evidence_by_index: dict[int, str] = {}
-        self._phase_timing_secs: dict[str, float] = {
-            "detect": 0.0,
-            "match": 0.0,
-            "transform": 0.0,
-            "subpixel": 0.0,
-            "warp": 0.0,
-            "blend": 0.0,
-        }
-    #
+        support_dest = registration.support_destination_points
+        if support_dest is not None:
+            support_dest = np.asarray(support_dest, dtype=np.float64)
+            if support_dest.ndim == 2 and support_dest.shape[1] == 2:
+                valid_support = np.isfinite(support_dest).all(axis=1)
+                support_dest = support_dest[valid_support]
+                if support_dest.size > 0:
+                    # Support points are canvas-space feature match positions.  They
+                    # should always be within the panel's natural content area, but we
+                    # clamp just in case of floating-point drift near the boundary.
+                    min_x = max(natural_min_x, min(min_x, float(np.min(support_dest[:, 0]))))
+                    min_y = max(natural_min_y, min(min_y, float(np.min(support_dest[:, 1]))))
+                    max_x = min(natural_max_x, max(max_x, float(np.max(support_dest[:, 0]))))
+                    max_y = min(natural_max_y, max(max_y, float(np.max(support_dest[:, 1]))))
+
+        mesh_x = registration.mesh_x
+        mesh_y = registration.mesh_y
+        mesh_h = registration.mesh_homographies
+        if mesh_x is None or mesh_y is None or mesh_h is None:
+            return min_x, min_y, max_x, max_y
+
+        mesh_x = np.asarray(mesh_x, dtype=np.float64)
+        mesh_y = np.asarray(mesh_y, dtype=np.float64)
+        mesh_h = np.asarray(mesh_h, dtype=np.float64)
+        if mesh_x.ndim != 1 or mesh_y.ndim != 1 or mesh_x.size < 2 or mesh_y.size < 2:
+            return min_x, min_y, max_x, max_y
+        if mesh_h.ndim != 4 or mesh_h.shape[:2] != (mesh_y.size, mesh_x.size) or mesh_h.shape[2:] != (3, 3):
+            return min_x, min_y, max_x, max_y
+
+        valid_nodes = np.isfinite(mesh_h).all(axis=(2, 3))
+        if not np.any(valid_nodes):
+            return min_x, min_y, max_x, max_y
+
+        valid_mesh_x = mesh_x[np.any(valid_nodes, axis=0)]
+        valid_mesh_y = mesh_y[np.any(valid_nodes, axis=1)]
+        if valid_mesh_x.size == 0 or valid_mesh_y.size == 0:
+            return min_x, min_y, max_x, max_y
+
+        pad_x = float(np.max(np.diff(mesh_x))) if mesh_x.size > 1 else 0.0
+        pad_y = float(np.max(np.diff(mesh_y))) if mesh_y.size > 1 else 0.0
+
+        # Clamp mesh expansion to the natural content bounds so the ±1-cell pad
+        # never pulls the ROI into canvas regions the panel cannot fill.
+        min_x = max(natural_min_x, min(min_x, float(np.min(valid_mesh_x)) - pad_x))
+        min_y = max(natural_min_y, min(min_y, float(np.min(valid_mesh_y)) - pad_y))
+        max_x = min(natural_max_x, max(max_x, float(np.max(valid_mesh_x)) + pad_x))
+        max_y = min(natural_max_y, max(max_y, float(np.max(valid_mesh_y)) + pad_y))
+        return min_x, min_y, max_x, max_y
 
     # ---- Shared helpers ----
     @staticmethod
@@ -249,13 +272,12 @@ class BaseStitchMode:
         )
 
     def _match_feature_pair(self, ref_keypoints, ref_descriptors, ref_scale, current_keypoints,
-                            current_descriptors, current_scale, allow_rotation=True):
+                            current_descriptors, current_scale):
         """Match features between a reference and current image pair.
 
         Args:
             ref_keypoints, ref_descriptors, ref_scale: Reference image features
             current_keypoints, current_descriptors, current_scale: Current image features
-            allow_rotation: Whether to allow rotation in homography (default True)
 
         Returns:
             `(local_transform, inlier_mask)` or `(None, None)` if matching fails.
@@ -263,7 +285,6 @@ class BaseStitchMode:
         local_transform, inlier_mask, _metrics = self._match_feature_pair_with_metrics(
             ref_keypoints, ref_descriptors, ref_scale,
             current_keypoints, current_descriptors, current_scale,
-            allow_rotation=allow_rotation,
         )
         return local_transform, inlier_mask
 
@@ -366,7 +387,7 @@ class BaseStitchMode:
             return local_transform, None
 
     def _match_feature_pair_with_metrics(self, ref_keypoints, ref_descriptors, ref_scale, current_keypoints,
-                                         current_descriptors, current_scale, allow_rotation=True,
+                                         current_descriptors, current_scale,
                                          ref_image=None, current_image=None):
         """Match features and return lightweight evidence metrics.
 
@@ -398,13 +419,66 @@ class BaseStitchMode:
             return None, None, self.matcher.describe_pair_evidence(feature_metrics)
 
         t_transform_start = time.perf_counter()
-        local_transform, inlier_mask = self.matcher.compute_transform(
-            ref_keypoints, current_keypoints, good_matches, ref_scale, current_scale, allow_rotation=allow_rotation
-        )
+        transform_mode = getattr(self.profile, "transform_mode", "affine")
+        apap_registration = None
+        if str(transform_mode or "").strip().lower() == "apap":
+            valid_pairs = []
+            kp1_len = len(ref_keypoints) if ref_keypoints is not None else 0
+            kp2_len = len(current_keypoints) if current_keypoints is not None else 0
+            for match in good_matches:
+                query_idx = int(getattr(match, "queryIdx", -1))
+                train_idx = int(getattr(match, "trainIdx", -1))
+                if query_idx < 0 or query_idx >= kp1_len or train_idx < 0 or train_idx >= kp2_len:
+                    continue
+                valid_pairs.append((query_idx, train_idx, float(getattr(match, "distance", np.inf))))
+            apap_registration = self.matcher.compute_apap_registration(
+                ref_keypoints,
+                current_keypoints,
+                valid_pairs,
+                scale1=ref_scale,
+                scale2=current_scale,
+            )
+            local_transform = apap_registration.homography
+            inlier_mask = apap_registration.inlier_mask
+        else:
+            local_transform, inlier_mask = self.matcher.compute_transform(
+                ref_keypoints, current_keypoints, good_matches, ref_scale, current_scale, transform_mode=transform_mode
+            )
+            transform_diag = getattr(self.matcher, "last_transform_diagnostics", {})
+            if (
+                str(transform_mode or "").strip().lower() == "homography"
+                and isinstance(transform_diag, dict)
+                and bool(transform_diag.get("used_fallback"))
+                and str(transform_diag.get("fallback_mode") or "").strip().lower() == "affine"
+                and local_transform is not None
+                and inlier_mask is not None
+            ):
+                rejected_mode = str(transform_diag.get("rejected_mode") or "homography")
+                rejection_reason = str(transform_diag.get("rejection_reason") or "unknown")
+                emit_msg(
+                    f"Homography rejected ({rejection_reason}); using affine fallback instead.",
+                    "debug",
+                    progress_cb,
+                )
+                feature_metrics["homography_fallback_used"] = True
+                feature_metrics["homography_rejected_mode"] = rejected_mode
+                feature_metrics["homography_rejection_reason"] = rejection_reason
         self._record_phase_time("transform", time.perf_counter() - t_transform_start)
         if inlier_mask is not None:
             feature_metrics["inlier_count"] = int(np.sum(inlier_mask))
-        if local_transform is not None and inlier_mask is not None:
+        if apap_registration is not None:
+            feature_metrics["apap_enabled"] = True
+            feature_metrics["apap_has_local_warp"] = bool(apap_registration.has_local_warp)
+            feature_metrics["apap_local_warp_ready"] = bool(
+                apap_registration.diagnostics.get("local_warp_ready", False)
+            )
+            feature_metrics["apap_mesh_cols"] = int(apap_registration.diagnostics.get("mesh_cols", 0) or 0)
+            feature_metrics["apap_mesh_rows"] = int(apap_registration.diagnostics.get("mesh_rows", 0) or 0)
+            feature_metrics["apap_support_point_count"] = int(
+                apap_registration.diagnostics.get("support_point_count", 0) or 0
+            )
+        refinement_mode = str(transform_mode or "affine").strip().lower()
+        if local_transform is not None and inlier_mask is not None and refinement_mode != "homography":
             t_subpixel_start = time.perf_counter()
             local_transform, refinement_metrics = self._refine_transform_with_phase_correlation(
                 ref_image,
@@ -412,11 +486,23 @@ class BaseStitchMode:
                 local_transform,
             )
             self._record_phase_time("subpixel", time.perf_counter() - t_subpixel_start)
+            if apap_registration is not None and local_transform is not None:
+                apap_estimator = getattr(self.matcher, "apap_estimator", None)
+                if apap_estimator is None:
+                    apap_estimator = APAPEstimator()
+                previous_h = np.asarray(apap_registration.homography, dtype=np.float64)
+                try:
+                    refinement_transform = np.asarray(local_transform, dtype=np.float64) @ np.linalg.inv(previous_h)
+                    apap_registration = apap_estimator.compose_registration(apap_registration, refinement_transform)
+                except np.linalg.LinAlgError:
+                    apap_registration = replace(apap_registration, homography=local_transform)
             if refinement_metrics is not None:
                 feature_metrics["subpixel_refinement_applied"] = bool(refinement_metrics.get("applied", False))
                 feature_metrics["subpixel_refinement_response"] = refinement_metrics.get("response", 0.0)
                 feature_metrics["subpixel_refinement_dx"] = refinement_metrics.get("dx", 0.0)
                 feature_metrics["subpixel_refinement_dy"] = refinement_metrics.get("dy", 0.0)
+        if apap_registration is not None:
+            feature_metrics["apap_registration"] = apap_registration
         feature_metrics["transform_found"] = bool(local_transform is not None and inlier_mask is not None)
         feature_metrics = self.matcher.describe_pair_evidence(feature_metrics)
         return local_transform, inlier_mask, feature_metrics
@@ -444,14 +530,14 @@ class BaseStitchMode:
 
         return False
 
+    # can be deleted??
     def _find_best_match_among_references(self, current_keypoints, current_descriptors, current_scale,
-                                          references, allow_rotation=True, cancel_cb=None):
+                                          references, cancel_cb=None):
         """Find best feature match among multiple reference images.
 
         Args:
             current_keypoints, current_descriptors, current_scale: Current image features
             references: List of reference dicts, each with keys: 'kp', 'des', 'scale', 'name'
-            allow_rotation: Whether to allow rotation (default True)
             cancel_cb: Optional cancellation callback
 
         Returns:
@@ -461,6 +547,7 @@ class BaseStitchMode:
         """
         best_match = None
         best_match_count = 0
+        transform_mode = getattr(self.profile, "transform_mode", "affine")
 
         # Iterate forward so equal scores continue to favor newer references.
         for ref_idx, reference in enumerate(references):
@@ -474,7 +561,7 @@ class BaseStitchMode:
 
             local_transform, inlier_mask = self.matcher.compute_transform(
                 reference["kp"], current_keypoints, good_matches, reference["scale"], current_scale,
-                allow_rotation=allow_rotation
+                transform_mode=transform_mode
             )
             if local_transform is None or inlier_mask is None:
                 continue
@@ -641,6 +728,14 @@ class BaseStitchMode:
         # Extract names and images
         images = [img for _, img in image_items]
         names = [name for name, _ in image_items]
+
+        # Optional pre-projection keeps feature detection, matching, and warping in the same image space.
+        warper = getattr(self, "warper", None)
+        if warper is not None and warper.is_projection_enabled():
+            mode = getattr(warper, "projection_mode", "native")
+            emit_msg(f"Projection mode: {mode}", "debug", progress_cb)
+            images = [warper.project_image(img) for img in images]
+
         n = len(images)
 
         if detect_features:
@@ -667,6 +762,10 @@ class BaseStitchMode:
             cache_enabled = bool(read_pref("stitch/feature_cache_enabled", True, type=bool))
         except Exception:
             cache_enabled = True
+        warper = getattr(self, "warper", None)
+        if cache_enabled and warper is not None and warper.is_projection_enabled():
+            cache_enabled = False
+            emit_msg("Feature cache disabled for projected sessions", "debug", progress_cb)
         cache_before = get_feature_cache_stats(reset_counters=cache_enabled)
         try:
             # Keep worker count bounded by panel count and CPU capacity.
@@ -717,7 +816,7 @@ class BaseStitchMode:
                     try:
                         cv2.setNumThreads(max(1, int(prev_cv_threads)))
                     except Exception:
-                        logger.debug("Could not restore OpenCV thread count after feature detection", exc_info=True)
+                        logger.debug("Could not restore thread count after feature detection", exc_info=True)
         except InterruptedError:
             raise
         except Exception as _exc:
@@ -1036,9 +1135,11 @@ class BaseStitchMode:
             if placement_score < min_blend_score:
                 warped_mask = warped_mask & (~mask_view.astype(bool))
 
+        gain_mode = str(getattr(self.profile, "gain_compensation", "none") or "none").strip().lower()
+
         # Pre-blend advanced gain compensation.
         # "uniform" and "local" apply photometric correction before blending.
-        if self.profile.gain_compensation not in ["none", "simple"]:
+        if gain_mode not in ["none", "simple"]:
             if enable_panel_flatten:
                 warped_img = self.normalizer.flatten_low_frequency(
                     warped_img,
@@ -1059,17 +1160,22 @@ class BaseStitchMode:
             else:
                 overlap = (mask_view > 0) & (warped_mask > 0)
 
-            if self.profile.gain_compensation == "local":
+            local_normalizer = getattr(self, "local_normalizer", None)
+            if gain_mode == "local" and local_normalizer is not None:
                 # Local (sub-tile) gain + offset compensation
                 tile_size = getattr(self.profile, "local_gain_tile_size", 128)
-                gain_map, offset_map = self.local_normalizer.compute_gain_map(
+                gain_map, offset_map = local_normalizer.compute_gain_map(
                     canvas_view,
                     warped_img,
                     overlap,
                     tile_size=tile_size
                 )
-                warped_img = self.local_normalizer.apply_gain(warped_img, gain_map, offset_map)
+                warped_img = local_normalizer.apply_gain(warped_img, gain_map, offset_map)
             else:
+                if gain_mode == "local" and local_normalizer is None:
+                    logger.debug(
+                        "Local gain compensation requested without local_normalizer; falling back to uniform correction."
+                    )
                 # Uniform gain+offset compensation
                 gain, offset = self.normalizer.compute_linear_correction(
                     canvas_view,
@@ -1098,10 +1204,10 @@ class BaseStitchMode:
         # simple: blender applies overlap-based gain, and optional offset matching
         # uniform/local: advanced correction already applied before blending
 
-        if self.profile.gain_compensation not in ["none", "simple"]:
+        if gain_mode not in ["none", "simple"]:
             use_simple_gain = False
             use_simple_offset = False
-        elif self.profile.gain_compensation == "simple":
+        elif gain_mode == "simple":
             use_simple_gain = True
             use_simple_offset = blend_offset_match
         else:
@@ -1225,6 +1331,8 @@ class BaseStitchMode:
     def _warp_and_blend_single_image(self, canvas_system, image, global_h, image_name, index,
                                      placement_score=None, min_blend_score=None,
                                      max_allowed_size=None,
+                                     max_allowed_pixels=None,
+                                     diagnostic_context=None,
                                      cancel_cb=None, progress_cb=None) -> bool:
         """Shared logic for warping and blending a single image onto canvas.
 
@@ -1251,11 +1359,75 @@ class BaseStitchMode:
 
         # Compute warp bounds
         min_x, min_y, max_x, max_y = canvas_system.compute_warp_bounds(image, global_h)
+        ctx = diagnostic_context if isinstance(diagnostic_context, dict) else {}
+        min_x, min_y, max_x, max_y = self._expand_bounds_with_apap_registration(
+            image,
+            (min_x, min_y, max_x, max_y),
+            ctx.get("apap_registration"),
+        )
+
+        h00 = h01 = h02 = h10 = h11 = h12 = float("nan")
+        det_2x2 = float("nan")
+        cond_2x2 = float("nan")
+        try:
+            h_mat = np.asarray(global_h, dtype=np.float64)
+            if h_mat.shape == (3, 3) and np.isfinite(h_mat).all():
+                h00, h01, h02 = float(h_mat[0, 0]), float(h_mat[0, 1]), float(h_mat[0, 2])
+                h10, h11, h12 = float(h_mat[1, 0]), float(h_mat[1, 1]), float(h_mat[1, 2])
+                linear = h_mat[:2, :2]
+                det_2x2 = float(np.linalg.det(linear))
+                cond_2x2 = float(np.linalg.cond(linear))
+        except Exception:
+            pass
+
+        ref_name = str(ctx.get("ref_name") or "n/a")
+        match_score = ctx.get("score")
+        fallback_used = bool(ctx.get("fallback", False))
+        mode_label = "phase" if fallback_used else "feature"
 
         # Validate bounds (with optional max size limit for FreeMode)
+        warp_w = int(np.ceil(abs(max_x - min_x)))
+        warp_h = int(np.ceil(abs(max_y - min_y)))
+        fl_image_name = first_and_last_part(os.path.basename(image_name), DISPLAY_NAME_SIZE)
+        fl_ref_name = first_and_last_part(os.path.basename(ref_name), DISPLAY_NAME_SIZE)
         if max_allowed_size is not None:
-            if abs(max_x - min_x) > max_allowed_size or abs(max_y - min_y) > max_allowed_size:
-                emit_msg(f"Skipping {os.path.basename(image_name)} (warp bounds too large)", "red", progress_cb)
+            if warp_w > max_allowed_size or warp_h > max_allowed_size:
+                emit_msg(f"Skipping {fl_image_name} (warp bounds too large)", "red", progress_cb)
+                emit_msg(
+                    (
+                        f"Skip diagnostics: panel={fl_image_name}, ref={fl_ref_name}, "
+                        f"mode={mode_label}, score={match_score}, bounds=({min_x:.1f},{min_y:.1f})-({max_x:.1f},{max_y:.1f}), "
+                        f"size={warp_w}x{warp_h}, limit_dim={int(max_allowed_size)}, "
+                        f"H=[[{h00:.4g},{h01:.4g},{h02:.4g}],[{h10:.4g},{h11:.4g},{h12:.4g}]], "
+                        f"det2x2={det_2x2:.4g}, cond2x2={cond_2x2:.4g}"
+                    ),
+                    "debug",
+                    progress_cb,
+                )
+                try:
+                    self._progress_skipped += 1
+                except Exception:
+                    pass
+                return False
+        if max_allowed_pixels is not None:
+            warp_pixels = int(warp_w * warp_h)
+            if warp_pixels > int(max_allowed_pixels):
+                emit_msg(
+                    f"Skipping {fl_image_name} (warp area too large: {warp_w}x{warp_h})",
+                    "red",
+                    progress_cb,
+                )
+                emit_msg(
+                    (
+                        f"Skip diagnostics: panel={fl_image_name}, ref={fl_ref_name}, "
+                        f"mode={mode_label}, score={match_score}, bounds=({min_x:.1f},{min_y:.1f})-({max_x:.1f},{max_y:.1f}), "
+                        f"size={warp_w}x{warp_h}, pixels={warp_pixels}, limit_pixels={int(max_allowed_pixels)}, "
+                        f"H=[[{h00:.4g},{h01:.4g},{h02:.4g}],[{h10:.4g},{h11:.4g},{h12:.4g}]], "
+                        f"det2x2={det_2x2:.4g}, cond2x2={cond_2x2:.4g}"
+                    ),
+                    "debug",
+                    progress_cb,
+                )
                 try:
                     self._progress_skipped += 1
                 except Exception:
@@ -1266,17 +1438,22 @@ class BaseStitchMode:
         try:
             canvas_system.expand_canvas(min_x, min_y, max_x, max_y)
         except ValueError as exc:
-            emit_msg(f"Skipping {os.path.basename(image_name)}: {exc}", "red", progress_cb)
+            emit_msg(f"Skipping {fl_image_name}: {exc}", "red", progress_cb)
             try:
                 self._progress_skipped += 1
             except Exception:
                 pass
             return False
 
-        # Adjust homography for canvas offset
-        h_adjusted = global_h.copy()
-        h_adjusted[0, 2] += canvas_system.offset_x
-        h_adjusted[1, 2] += canvas_system.offset_y
+        # Compose canvas offset with global homography.
+        # Must use matrix multiplication for projective transforms to handle perspective
+        # division correctly. For affine-only transforms this is equivalent to adding
+        # offset_x and offset_y to translation components, but projective terms (h20, h21)
+        # require proper matrix composition: T @ H rather than H[0:2,2] += offset.
+        T_canvas = np.eye(3, dtype=np.float64)
+        T_canvas[0, 2] = canvas_system.offset_x
+        T_canvas[1, 2] = canvas_system.offset_y
+        h_adjusted = T_canvas @ global_h
 
         roi_pad = self._compute_roi_padding()
         roi_x0 = max(0, int(np.floor(min_x + canvas_system.offset_x)) - roi_pad)
@@ -1288,7 +1465,20 @@ class BaseStitchMode:
         # Warp image
         try:
             t_warp_start = time.perf_counter()
-            warped_img, warped_mask = self.warper.warp_into_roi(image, h_adjusted, roi_bounds)
+            apap_registration = ctx.get("apap_registration")
+            if isinstance(apap_registration, APAPRegistrationResult):
+                apap_estimator = getattr(self.matcher, "apap_estimator", None)
+                if apap_estimator is None:
+                    apap_estimator = APAPEstimator()
+                registration_adjusted = apap_estimator.with_canvas_offset(apap_registration, canvas_system.offset_x, canvas_system.offset_y)
+                warped_img, warped_mask = self.warper.warp_apap(
+                    image,
+                    registration_adjusted,
+                    (roi_y1 - roi_y0, roi_x1 - roi_x0),
+                    roi_origin=(roi_x0, roi_y0),
+                )
+            else:
+                warped_img, warped_mask = self.warper.warp_into_roi(image, h_adjusted, roi_bounds)
             self._record_phase_time("warp", time.perf_counter() - t_warp_start)
         except Exception:
             import traceback

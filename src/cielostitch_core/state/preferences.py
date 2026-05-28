@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass
 from PySide6.QtCore import QSettings, QStandardPaths
 from .. import app_name
+from cielostitch_core.config.constants import DEFAULT_MESSAGE_COLORS_STR, VALID_LOG_LEVELS, DEFAULT_ENGINE
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +45,11 @@ def _normalize_hidden_csv_pref(value, default: str) -> str:
     return ",".join(parts)
 
 
-_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-
 def _normalize_log_level(value, default: str) -> str:
     if value is None:
         return default
     normalized = str(value).strip().upper()
-    if normalized in _VALID_LOG_LEVELS:
+    if normalized in VALID_LOG_LEVELS:
         return normalized
     return default
 
@@ -128,6 +127,7 @@ class AppPreferences:
     stitch_interpolator: str = "auto"
     stitch_precision_mode: str = "auto"
     default_resolve_for: str = "balanced"
+    enable_subpixel_refinement: bool = True
     retain_overlap_diagnostics: bool = True
     retain_seam_diagnostics: bool = True
     enable_candidate_debug: bool = False
@@ -151,10 +151,14 @@ class AppPreferences:
     save_seam_coverage: bool = False
 
     #extra
-    enable_subpixel_refinement: bool = True
-    log_message_colors: str = "default,red,yellow,green,debug"
+    developer_mode: bool = False
+    log_message_colors: str = DEFAULT_MESSAGE_COLORS_STR
     stderr_log_level: str = "WARNING"
     check_for_updates_on_startup: bool = True
+
+    #gen
+    default_stitching_engine: str = DEFAULT_ENGINE
+    simple_engine_timeout_sec: int = 100
 
     @classmethod
     def load(cls) -> "AppPreferences":
@@ -168,6 +172,10 @@ class AppPreferences:
                 "ui/show_tooltips", cls.show_tooltips, type=bool)),
             theme=str(read_pref(
                 "ui/theme", cls.theme, type=str)),
+            default_stitching_engine=str(read_pref(
+                "gen/default_stitching_engine", cls.default_stitching_engine, type=str)),
+            simple_engine_timeout_sec=max(0, int(str(read_pref(
+                "gen/simple_engine_timeout_sec", cls.simple_engine_timeout_sec, type=int)))),
 
             #input
             input_display_mode=str(read_pref(
@@ -246,6 +254,10 @@ class AppPreferences:
                 ),
                 cls.enable_subpixel_refinement,
             ),
+            developer_mode=_normalize_hidden_bool_pref(
+                read_pref("extra/developer_mode", None),
+                cls.developer_mode,
+            ),
             log_message_colors=_normalize_hidden_csv_pref(
                 read_pref("extra/log_message_colors", cls.log_message_colors),
                 cls.log_message_colors,
@@ -307,9 +319,13 @@ class AppPreferences:
         write_pref("export/save_seam_coverage", bool(self.save_seam_coverage))
 
         #extra
+        write_pref("extra/developer_mode", bool(self.developer_mode))
         write_pref("extra/log_message_colors", _normalize_hidden_csv_pref(self.log_message_colors, self.log_message_colors))
         write_pref("extra/stderr_log_level", _normalize_log_level(self.stderr_log_level, self.stderr_log_level))
         write_pref("extra/check_for_updates_on_startup", bool(self.check_for_updates_on_startup))
 
+        #gen
+        write_pref("gen/default_stitching_engine", str(self.default_stitching_engine or "cielo").strip().lower() or "cielo")
+        write_pref("gen/simple_engine_timeout_sec", max(0, int(self.simple_engine_timeout_sec)))
         sync_prefs()
 

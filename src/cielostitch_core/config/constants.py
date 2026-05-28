@@ -28,6 +28,8 @@ MAX_CANVAS_DIM = 50_000
 MAX_CANVAS_PIXELS = 1_000_000_000
 AUTO_MODE_MAX_WARP_DIM = 25_000
 GRID_MODE_MAX_WARP_DIM = 30_000
+AUTO_MODE_MAX_WARP_PIXELS = 40_000_000
+GRID_MODE_MAX_WARP_PIXELS = 50_000_000
 
 ALPHA_POLICY_SCAN_LIMIT = 1_000
 FEATURE_CACHE_CAPACITY = 512
@@ -53,7 +55,14 @@ DEFAULT_OVERLAP_PCT = 20.00
 # Blending
 MAX_MULTIBAND_LEVELS = 7
 
+# all keys: default,red,yellow,green,panel,none,"",cli
+DEFAULT_MESSAGE_COLORS_STR = "default,red,yellow,green,cli"
+VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
 # Exposed profiles in UI (order = how they appear in the combo box)
+ENGINES = ["auto", "simple", "cielo"]
+DEFAULT_ENGINE = 'cielo'
+SIMPLE_ENGINE_MODES = ["auto", "panorama", "scans"]
 IMAGE_PROFILES = [
     "solar",
     "solar-h-alpha",
@@ -84,6 +93,11 @@ GAIN_COMPENSATION_OPTIONS = ["none", "simple", "uniform", "local"]
 SIMPLE_GAIN_METHODS = ["mean", "median", "trimmed"]
 SEAMLESS_OPTIONS = ["fast", "balanced", "best"]
 SPEED_PRESETS = ["fast", "balanced", "best"]
+PROJECTION_MODES = ["native", "cylindrical"]
+# Transform model options for feature matching
+TRANSFORM_MODES = ["translation", "affine", "homography", "apap"]
+BUNDLE_ADJUSTMENT_MODES = ["off", "translation", "affine"]
+FPX_MODES = ["factor", "fov", "camera"]
 MOUNT_PRECISIONS = ["tight", "normal", "sloppy", "manual", "handheld"]
 SEEING_CONDITIONS = ["poor", "average", "good"]
 SCAN_ORDERS = ["row-wise", "column-wise"]
@@ -105,4 +119,3 @@ IMAGE_FILTER_LST = (
 # Shared dtype label format for status/log/save text.
 # Allowed values: "long" (float32), "short" (f32), "int" (32)
 DTYPE_LABEL_FORMAT = "long"
-DEFAULT_MESSAGE_COLORS = {"", "default", "red", "green", "yellow", "cli"}

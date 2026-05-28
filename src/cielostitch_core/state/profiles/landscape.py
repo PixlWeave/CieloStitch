@@ -62,4 +62,5 @@ class LandscapeProfile:
     min_inliers = 8
     # Note: detector_downscale shared with Detection section.
     # Prohibit rotation in transform solve when True; stabilizes grid mosaics on tracking mounts.
-    lock_rotation = True
+    # Transform model for feature matching: 'auto', 'affine', 'homography', 'translation'
+    transform_mode = "affine"

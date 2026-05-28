@@ -36,6 +36,8 @@ class Blender:
     }
     PHOTOMETRIC_MIN_OVERLAP_PX = 2_000
     PHOTOMETRIC_FULL_CONFIDENCE_PX = 250_000
+    GHOST_GUARD_RISK_THRESHOLD = 0.55
+    GHOST_GUARD_FEATHER_PX = 20 #18
     GAIN_SAMPLE_THRESHOLD = 5_000_000
     GAIN_SAMPLE_SIZE = 1_000_000
     DIAGNOSTIC_SAMPLE_THRESHOLD = 1_000_000
@@ -83,6 +85,11 @@ class Blender:
                     f"Invalid value for '{field_name}': expected an integer, got {value!r}."
                 ) from exc
 
+    @staticmethod
+    def _coalesce_none(value, default):
+        """Treat explicit None as missing and return a safe default."""
+        return default if value is None else value
+
     def __init__(
             self,
             feather_px, #40
@@ -99,6 +106,10 @@ class Blender:
             adaptive_mb_max_boost=1,
                 photometric_min_overlap_px=2_000,
                 photometric_full_confidence_px=250_000,
+            ghost_guard_enabled=False,
+            ghost_guard_mode="content-aware",
+            ghost_guard_risk_threshold=0.55,
+            ghost_guard_feather_px=20,
     ):
         self.feather_px = feather_px
         self.gain_method = gain_method
@@ -123,6 +134,14 @@ class Blender:
             photometric_full_confidence_px,
             "photometric_full_confidence_px",
         )
+        ghost_risk_threshold = self._require_float(
+            self._coalesce_none(ghost_guard_risk_threshold, self.GHOST_GUARD_RISK_THRESHOLD),
+            "ghost_guard_risk_threshold",
+        )
+        ghost_feather_px = self._require_int(
+            self._coalesce_none(ghost_guard_feather_px, self.GHOST_GUARD_FEATHER_PX),
+            "ghost_guard_feather_px",
+        )
 
         self.adaptive_mb_risk_boost_threshold = float(np.clip(risk_boost, 0.0, 1.0))
         self.adaptive_mb_low_risk_threshold = float(np.clip(low_risk, 0.0, 1.0))
@@ -132,6 +151,12 @@ class Blender:
             self.photometric_min_overlap_px,
             full_confidence,
         )
+        self.ghost_guard_enabled = bool(ghost_guard_enabled)
+        self.ghost_guard_mode = str(ghost_guard_mode or "content-aware").strip().lower()
+        if self.ghost_guard_mode not in {"feather", "content-aware"}:
+            self.ghost_guard_mode = "content-aware"
+        self.ghost_guard_risk_threshold = float(np.clip(ghost_risk_threshold, 0.0, 1.0))
+        self.ghost_guard_feather_px = max(self.MIN_FEATHER_PX, int(ghost_feather_px))
 
         # Map seamless quality to parameters
         self._setup_seamless_params(seamless_quality)
@@ -600,54 +625,36 @@ class Blender:
         if src_vals.size == 0 or ref_vals.size == 0:
             return source
 
-        # Build the LUT in a shared 8-bit intensity domain.
-        if source.dtype == np.uint8 and reference.dtype == np.uint8:
-            src_domain = source
-            ref_domain = reference
-            src_hist, _ = np.histogram(src_vals, bins=256, range=(0, 256))
-            ref_hist, _ = np.histogram(ref_vals, bins=256, range=(0, 256))
-            domain_min = 0.0
-            domain_max = 255.0
-        else:
-            src_vals_f32 = src_vals.astype(np.float32, copy=False)
-            ref_vals_f32 = ref_vals.astype(np.float32, copy=False)
+        src_vals_f64 = src_vals.astype(np.float64, copy=False)
+        ref_vals_f64 = ref_vals.astype(np.float64, copy=False)
+        if not np.all(np.isfinite(src_vals_f64)) or not np.all(np.isfinite(ref_vals_f64)):
+            return source
 
-            domain_min = float(min(np.min(src_vals_f32), np.min(ref_vals_f32)))
-            domain_max = float(max(np.max(src_vals_f32), np.max(ref_vals_f32)))
-            if not np.isfinite(domain_min) or not np.isfinite(domain_max) or domain_max <= domain_min:
-                return source
+        src_unique, src_counts = np.unique(src_vals_f64, return_counts=True)
+        ref_unique, ref_counts = np.unique(ref_vals_f64, return_counts=True)
+        if src_unique.size == 0 or ref_unique.size == 0:
+            return source
 
-            scale = 255.0 / (domain_max - domain_min)
-            src_domain = np.clip((source.astype(np.float32) - domain_min) * scale, 0.0, 255.0).astype(np.uint8)
-            ref_domain = np.clip((reference.astype(np.float32) - domain_min) * scale, 0.0, 255.0).astype(np.uint8)
+        src_quantiles = np.cumsum(src_counts).astype(np.float64)
+        src_quantiles /= src_quantiles[-1]
+        ref_quantiles = np.cumsum(ref_counts).astype(np.float64)
+        ref_quantiles /= ref_quantiles[-1]
 
-            src_hist, _ = np.histogram(
-                np.clip((src_vals_f32 - domain_min) * scale, 0.0, 255.0),
-                bins=256,
-                range=(0, 256),
-            )
-            ref_hist, _ = np.histogram(
-                np.clip((ref_vals_f32 - domain_min) * scale, 0.0, 255.0),
-                bins=256,
-                range=(0, 256),
-            )
+        matched_unique = np.interp(src_quantiles, ref_quantiles, ref_unique)
+        source_f64 = source.astype(np.float64, copy=False)
+        matched = np.interp(
+            source_f64,
+            src_unique,
+            matched_unique,
+            left=matched_unique[0],
+            right=matched_unique[-1],
+        )
 
-        src_cdf = np.cumsum(src_hist).astype(np.float64)
-        src_cdf /= src_cdf[-1] + 1e-10
-        ref_cdf = np.cumsum(ref_hist).astype(np.float64)
-        ref_cdf /= ref_cdf[-1] + 1e-10
+        if np.issubdtype(source.dtype, np.integer):
+            info = np.iinfo(source.dtype)
+            matched = np.rint(np.clip(matched, info.min, info.max))
 
-        # Build lookup table: for each source intensity, find matching reference intensity
-        lut = np.searchsorted(ref_cdf, src_cdf, side='left').clip(0, 255).astype(np.uint8)
-
-        # Apply lookup table
-        matched_domain = lut[src_domain]
-        if source.dtype == np.uint8 and reference.dtype == np.uint8:
-            return matched_domain
-
-        scale_back = (domain_max - domain_min) / 255.0
-        result = matched_domain.astype(np.float32) * scale_back + domain_min
-        return result.astype(source.dtype, copy=False)
+        return matched.astype(source.dtype, copy=False)
 
     def _apply_histogram_matching(self, canvas, img, overlap):
         """Apply histogram matching to img to match canvas in overlap region."""
@@ -675,7 +682,7 @@ class Blender:
         """Compute optimal pyramid levels from overlap geometry and seam-risk cues."""
         effective_overlap_thickness = self.estimate_overlap_thickness(overlap)
         if effective_overlap_thickness <= 0:
-            return self.multiband_levels
+            return 2
 
         # Adaptive levels based on overlap size
         if effective_overlap_thickness < self.ADAPTIVE_MB_SMALL_OVERLAP:
@@ -694,7 +701,7 @@ class Blender:
         elif risk <= self.adaptive_mb_low_risk_threshold and levels > 3:
             levels -= 1
 
-        return int(np.clip(levels, 3, min(self.MAX_MULTIBAND_LEVELS, self.multiband_levels + self.adaptive_mb_max_boost)))
+        return int(np.clip(levels, 2, min(5, self.MAX_MULTIBAND_LEVELS, self.multiband_levels + self.adaptive_mb_max_boost)))
 
     def _get_seamless_multiband_levels(self):
         """Return the multiband depth configured for the seamless mode."""
@@ -733,7 +740,7 @@ class Blender:
         if blend_type not in ("feather", "adaptive-feather"):
             return None
 
-        base_feather = int(self.feather_px or self.DEFAULT_FEATHER_PX)
+        base_feather = int((self.feather_px or self.DEFAULT_FEATHER_PX))
         if blend_type != "adaptive-feather" or overlap is None or not np.any(overlap):
             return max(self.MIN_FEATHER_PX, base_feather)
 
@@ -1111,6 +1118,205 @@ class Blender:
             blended_mask[overlap] = True
         return canvas
 
+    def _compute_overlap_seam_cost(self, canvas, img, overlap):
+        """Build a content-aware seam cost map inside the overlap ROI."""
+        overlap_bool = np.asarray(overlap, dtype=bool)
+        overlap_bbox = self._mask_bbox(overlap_bool)
+        if overlap_bbox is None:
+            return None, None, None
+
+        y0, y1, x0, x1 = overlap_bbox
+        overlap_roi = overlap_bool[y0:y1, x0:x1]
+        if not np.any(overlap_roi):
+            return None, None, None
+
+        canvas_f = np.asarray(canvas[y0:y1, x0:x1], dtype=np.float32)
+        img_f = np.asarray(img[y0:y1, x0:x1], dtype=np.float32)
+
+        if canvas_f.ndim > 2:
+            canvas_lum = self._rgb_to_luminance(canvas_f)
+        else:
+            canvas_lum = canvas_f
+        if img_f.ndim > 2:
+            img_lum = self._rgb_to_luminance(img_f)
+        else:
+            img_lum = img_f
+
+        lum_diff = np.abs(canvas_lum - img_lum)
+        gx_c = cv2.Sobel(canvas_lum, cv2.CV_32F, 1, 0, ksize=3)
+        gy_c = cv2.Sobel(canvas_lum, cv2.CV_32F, 0, 1, ksize=3)
+        gx_i = cv2.Sobel(img_lum, cv2.CV_32F, 1, 0, ksize=3)
+        gy_i = cv2.Sobel(img_lum, cv2.CV_32F, 0, 1, ksize=3)
+        grad_c = np.sqrt(gx_c ** 2 + gy_c ** 2)
+        grad_i = np.sqrt(gx_i ** 2 + gy_i ** 2)
+        grad_diff = np.abs(grad_c - grad_i)
+        edge_penalty = np.minimum(1.0, np.maximum(grad_c, grad_i) / (np.percentile(np.maximum(grad_c, grad_i), 95) + 1e-6))
+
+        h, w = overlap_roi.shape
+        if h >= w:
+            center_bias = np.abs(np.arange(w, dtype=np.float32) - ((w - 1) * 0.5))[None, :]
+            center_bias /= max(1.0, (w - 1) * 0.5)
+        else:
+            center_bias = np.abs(np.arange(h, dtype=np.float32) - ((h - 1) * 0.5))[:, None]
+            center_bias /= max(1.0, (h - 1) * 0.5)
+
+        cost = (0.50 * lum_diff) + (0.35 * grad_diff) + (0.15 * edge_penalty) + (0.05 * center_bias)
+        valid_cost = cost[overlap_roi]
+        if valid_cost.size == 0:
+            return None, None, None
+        scale = float(np.percentile(valid_cost, 95)) + 1e-6
+        cost = cost / scale
+        cost = np.clip(cost, 0.0, 4.0).astype(np.float32, copy=False)
+        cost[~overlap_roi] = 1e6
+        return cost, overlap_roi, overlap_bbox
+
+    @staticmethod
+    def _find_min_cost_seam(cost_map, overlap_mask):
+        """Return a one-pixel seam mask through the overlap using dynamic programming."""
+        if cost_map is None or overlap_mask is None:
+            return None, None
+        mask = np.asarray(overlap_mask, dtype=bool)
+        cost = np.asarray(cost_map, dtype=np.float32)
+        if cost.ndim != 2 or mask.ndim != 2 or cost.shape != mask.shape or not np.any(mask):
+            return None, None
+
+        height, width = mask.shape
+        vertical = height >= width
+        work_cost = cost if vertical else cost.T
+        work_mask = mask if vertical else mask.T
+        rows, cols = work_cost.shape
+        finite_penalty = np.float32(1e6)
+
+        dp = np.full((rows, cols), finite_penalty, dtype=np.float32)
+        parent = np.full((rows, cols), -1, dtype=np.int32)
+
+        first_valid = np.flatnonzero(work_mask[0])
+        if first_valid.size == 0:
+            return None, None
+        dp[0, first_valid] = work_cost[0, first_valid]
+
+        for row in range(1, rows):
+            valid_cols = np.flatnonzero(work_mask[row])
+            if valid_cols.size == 0:
+                return None, None
+            for col in valid_cols:
+                start = max(0, col - 1)
+                stop = min(cols, col + 2)
+                prev_vals = dp[row - 1, start:stop]
+                best_local = int(np.argmin(prev_vals))
+                best_col = start + best_local
+                best_val = float(prev_vals[best_local])
+                if not np.isfinite(best_val) or best_val >= finite_penalty:
+                    continue
+                dp[row, col] = work_cost[row, col] + best_val
+                parent[row, col] = best_col
+
+        last_valid = np.flatnonzero(work_mask[-1])
+        if last_valid.size == 0:
+            return None, None
+        last_scores = dp[-1, last_valid]
+        best_last_idx = int(np.argmin(last_scores))
+        best_col = int(last_valid[best_last_idx])
+        if not np.isfinite(dp[-1, best_col]) or dp[-1, best_col] >= finite_penalty:
+            return None, None
+
+        seam = np.zeros_like(work_mask, dtype=bool)
+        row = rows - 1
+        col = best_col
+        while row >= 0 and col >= 0:
+            seam[row, col] = True
+            if row == 0:
+                break
+            col = int(parent[row, col])
+            row -= 1
+        if not vertical:
+            seam = seam.T
+        return seam, ("vertical" if vertical else "horizontal")
+
+    def _content_aware_feather_blend(
+        self,
+        canvas,
+        img,
+        canvas_mask,
+        img_mask,
+        overlap,
+        blended_mask=None,
+        seam_heatmap=None,
+    ):
+        """Blend using a minimum-cost seam with a narrow feather around it."""
+        cost_map, overlap_roi, overlap_bbox = self._compute_overlap_seam_cost(canvas, img, overlap)
+        if cost_map is None or overlap_roi is None or overlap_bbox is None:
+            logger.debug("ghost_guard content-aware degraded: reason=seam_cost_unavailable")
+            return self._fallback_feather_blend(canvas, img, canvas_mask, img_mask, overlap, blended_mask)
+
+        seam_mask, orientation = self._find_min_cost_seam(cost_map, overlap_roi)
+        if seam_mask is None:
+            logger.debug("ghost_guard content-aware degraded: reason=seam_path_unavailable")
+            return self._fallback_feather_blend(canvas, img, canvas_mask, img_mask, overlap, blended_mask)
+
+        y0, y1, x0, x1 = overlap_bbox
+        roi_bbox = self._compute_shared_blend_bbox(canvas_mask, img_mask)
+        if roi_bbox is None:
+            return canvas
+        ry0, ry1, rx0, rx1 = roi_bbox
+
+        local_y0 = y0 - ry0
+        local_y1 = y1 - ry0
+        local_x0 = x0 - rx0
+        local_x1 = x1 - rx0
+
+        alpha_w = self._distance_weight_alpha(
+            canvas_mask[ry0:ry1, rx0:rx1], img_mask[ry0:ry1, rx0:rx1]
+        ).astype(np.float32, copy=False)
+        alpha_local = alpha_w[local_y0:local_y1, local_x0:local_x1].copy()
+
+        if orientation == "vertical":
+            seam_x = np.argmax(seam_mask, axis=1).astype(np.float32)
+            x_coords = np.arange(seam_mask.shape[1], dtype=np.float32)[None, :]
+            signed = x_coords - seam_x[:, None]
+        else:
+            seam_y = np.argmax(seam_mask, axis=0).astype(np.float32)
+            y_coords = np.arange(seam_mask.shape[0], dtype=np.float32)[:, None]
+            signed = y_coords - seam_y[None, :]
+
+        feather = max(self.MIN_FEATHER_PX, int(self.ghost_guard_feather_px or self.feather_px or self.DEFAULT_FEATHER_PX))
+        seam_alpha = np.clip(0.5 + (signed / max(1.0, float(feather))) * 0.5, 0.0, 1.0).astype(np.float32, copy=False)
+        seam_alpha[~overlap_roi] = alpha_local[~overlap_roi]
+        alpha_local[overlap_roi] = seam_alpha[overlap_roi]
+        alpha_w[local_y0:local_y1, local_x0:local_x1] = alpha_local
+
+        canvas_f = canvas.astype(np.float32, copy=False)
+        img_f = img.astype(np.float32, copy=False)
+        canvas_roi = canvas_f[ry0:ry1, rx0:rx1]
+        img_roi = img_f[ry0:ry1, rx0:rx1]
+        overlap_roi_full = overlap[ry0:ry1, rx0:rx1]
+        alpha_exp = alpha_w[..., None] if canvas_roi.ndim > 2 else alpha_w
+        blended_full = canvas_roi * (1.0 - alpha_exp) + img_roi * alpha_exp
+        canvas_roi[overlap_roi_full] = blended_full[overlap_roi_full]
+
+        if np.issubdtype(canvas.dtype, np.integer):
+            info = np.iinfo(canvas.dtype)
+            canvas_f = np.clip(canvas_f, info.min, info.max)
+        canvas = canvas_f.astype(canvas.dtype, copy=False)
+
+        if blended_mask is not None:
+            blended_mask[overlap] = True
+        if seam_heatmap is not None:
+            seam_strength = np.zeros_like(overlap_roi, dtype=np.float32)
+            seam_strength[seam_mask] = 1.0
+            seam_strength = cv2.GaussianBlur(seam_strength, (0, 0), sigmaX=max(1.0, feather * 0.35))
+            seam_strength[seam_strength < 0.05] = 0.0
+            seam_roi = seam_heatmap[y0:y1, x0:x1]
+            seam_roi[overlap_roi] = np.maximum(seam_roi[overlap_roi], seam_strength[overlap_roi])
+        logger.debug(
+            "ghost_guard fallback applied: blend_type=%s ghost_guard_mode=content-aware orientation=%s overlap_px=%d feather_px=%d",
+            str(self.blend_type),
+            orientation,
+            int(np.count_nonzero(overlap_roi)),
+            int(feather),
+        )
+        return canvas
+
     def _distance_weight_alpha(self, canvas_mask, img_mask):
         """Compute per-pixel blend weight for the new image in overlap regions."""
         canvas_u8 = canvas_mask.astype(np.uint8)
@@ -1324,6 +1530,7 @@ class Blender:
     # --------------------------------------------------
     # Main Blend Function
     # --------------------------------------------------
+
     def blend(
         self,
         canvas,
@@ -1337,7 +1544,7 @@ class Blender:
         blended_mask=None,
         seam_heatmap=None,
     ):
-        """Blend new image into canvas."""
+        """Blend new image into canvas. Logs APAP/overlap diagnostics for debugging."""
 
         # Ensure canvas and img have compatible dimensions
         canvas, img = self._align_array_dims(canvas, img)
@@ -1361,6 +1568,22 @@ class Blender:
         img_roi = img[y0:y1, x0:x1]
         canvas_roi = canvas[y0:y1, x0:x1]
         img_mask_roi = img_mask[y0:y1, x0:x1]
+
+        # --- APAP/Blending Diagnostics ---
+        logger.info(
+            "[BLEND] Overlap px: %d, Overlap bbox: %s, Mask valid: %s, GhostGuard: %s, BlendType: %s",
+            int(np.count_nonzero(overlap)),
+            str(img_bbox),
+            str(np.all(np.isfinite(img_mask))),
+            str(self.ghost_guard_enabled),
+            str(self.blend_type),
+        )
+        if not np.any(overlap):
+            logger.warning("[BLEND] No overlap detected between canvas and image. Check APAP mask output.")
+        if not np.all(np.isfinite(img_mask)):
+            logger.warning("[BLEND] Non-finite values in img_mask. APAP/warper may have produced invalid mask.")
+        if np.count_nonzero(overlap) < 32:
+            logger.warning("[BLEND] Very small overlap region (%d px). APAP may have produced fragmented overlap.", int(np.count_nonzero(overlap)))
 
         # Apply histogram matching before gain (if enabled)
         if self.histogram_matching and has_overlap and overlap_confidence > 0.0:
@@ -1420,6 +1643,61 @@ class Blender:
             img[y0:y1, x0:x1] = img_roi_f32.astype(img.dtype, copy=False)
 
         if has_overlap:
+            risk = None
+            should_apply_ghost_guard = (
+                self.ghost_guard_enabled
+                and self.blend_type in (
+                    "feather",
+                    "adaptive-feather",
+                    "multiband",
+                    "adaptive-multiband",
+                    "seamless",
+                )
+            )
+            if should_apply_ghost_guard:
+                try:
+                    risk = self._compute_overlap_seam_risk(canvas, img, overlap)
+                except Exception:
+                    risk = None
+                if risk is not None and risk >= self.ghost_guard_risk_threshold:
+                    logger.debug(
+                        "ghost_guard triggered: blend_type=%s ghost_guard_mode=%s risk=%.3f threshold=%.3f overlap_px=%d",
+                        str(self.blend_type),
+                        self.ghost_guard_mode,
+                        float(risk),
+                        float(self.ghost_guard_risk_threshold),
+                        int(np.count_nonzero(overlap)),
+                    )
+                    if self.ghost_guard_mode == "content-aware":
+                        canvas = self._content_aware_feather_blend(
+                            canvas,
+                            img,
+                            canvas_mask,
+                            img_mask,
+                            overlap,
+                            blended_mask=blended_mask,
+                            seam_heatmap=seam_heatmap,
+                        )
+                    else:
+                        logger.debug(
+                            "ghost_guard fallback applied: blend_type=%s ghost_guard_mode=feather feather_px=%d",
+                            str(self.blend_type),
+                            int(self.ghost_guard_feather_px),
+                        )
+                        original_feather = self.feather_px
+                        try:
+                            self.feather_px = min(int(original_feather or self.ghost_guard_feather_px), self.ghost_guard_feather_px)
+                            canvas = self._fallback_feather_blend(canvas, img, canvas_mask, img_mask, overlap, blended_mask)
+                        finally:
+                            self.feather_px = original_feather
+                    new_pixels = img_mask & (~canvas_mask)
+                    if np.any(new_pixels):
+                        canvas[new_pixels] = img[new_pixels]
+                    if coverage_count is not None:
+                        coverage_count[img_mask] += 1
+                    canvas_mask |= img_mask
+                    return canvas, canvas_mask
+
             if self.blend_type == "none":
                 pass
             elif self.blend_type == "adaptive-feather":

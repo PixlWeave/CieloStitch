@@ -12,11 +12,14 @@ import os
 from typing import Optional
 import time
 import logging
-from ...config.config import cfg
-from ...config.constants import GRID_MODE_MAX_WARP_DIM, FIXED_OVERLAP_MODES
-from ...core.mosaic_canvas import MosaicCanvas
-from ...utils.message import emit_msg
-from ...core.stitching.base_mode import BaseStitchMode
+from cielostitch_core.config.config import cfg
+from cielostitch_core.config.constants import GRID_MODE_MAX_WARP_DIM, GRID_MODE_MAX_WARP_PIXELS, FIXED_OVERLAP_MODES
+from cielostitch_core.core.bundle import BundleAdjustmentDiagnostics, BundleAdjustmentEdge, refine_global_transforms
+from cielostitch_core.core.mosaic_canvas import MosaicCanvas
+from cielostitch_core.utils.message import emit_msg
+from cielostitch_core.stitching.base_mode import BaseStitchMode
+from cielostitch_core.utils.strings import first_and_last_part
+from cielostitch_app.config.ui_constants import DISPLAY_NAME_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,8 @@ class GridMode(BaseStitchMode):
         self._slot_of_index = None
         self._slot_to_index = None
         self._rows = None
+        self._bundle_candidates = []
+        self.last_bundle_adjustment_diagnostics = None
 
     def stitch(self, image_items, progress_cb=None, cancel_cb=None):
         deterministic_mode = cfg.state.stitch_mode in FIXED_OVERLAP_MODES
@@ -42,24 +47,20 @@ class GridMode(BaseStitchMode):
 
         # Phase 2: Initialize canvas and placed references
         t_setup = time.perf_counter()
-        first_name, first_image = image_items[0]
+        first_name, first_image = names[0], images[0]
         canvas_system = MosaicCanvas(
             first_image,
             enable_overlap_diagnostics=bool(getattr(cfg.prefs, "retain_overlap_diagnostics", True)),
             enable_seam_diagnostics=bool(getattr(cfg.prefs, "retain_seam_diagnostics", True)),
         )
         self._init_grid_layout(image_count)
-        emit_msg(f"Session stitch mode: {cfg.state.stitch_mode}", "debug", progress_cb)
-        emit_msg(
-            f"Rotation lock: {'on' if bool(getattr(self.profile, 'lock_rotation', False)) else 'off'}",
-            "debug",
-            progress_cb,
-        )
+        # emit_msg(f"Session stitch mode: {cfg.state.stitch_mode}", "debug", progress_cb)
         emit_msg(f"Completing post-detect setup", "", progress_cb)
 
         global_transforms, placement_scores, skipped = self._compute_global_transforms(
             image_count, images, names, features, cancel_cb, progress_cb
         )
+        global_transforms = self._refine_global_transforms(global_transforms, progress_cb)
 
         self._preallocate_canvas_once(canvas_system, images, global_transforms)
         emit_msg(f"Post-detect setup {time.perf_counter() - t_setup:.2f}s", "", progress_cb)
@@ -71,7 +72,7 @@ class GridMode(BaseStitchMode):
             cancel_cb, progress_cb
         )
 
-        self._sync_random_counters(len(image_items), skipped)
+        self._sync_random_counters(image_count, skipped)
         return self._finalize_stitch(canvas_system, start_time, progress_cb=progress_cb, heal_seams=True)
 
     @staticmethod
@@ -122,6 +123,8 @@ class GridMode(BaseStitchMode):
     def _compute_global_transforms(self, image_count, images, names, features, cancel_cb, progress_cb):
         global_transforms: list[Optional[np.ndarray]] = [None] * image_count
         placement_scores = [0.0] * image_count
+        self._bundle_candidates = [[] for _ in range(image_count)]
+        self.last_bundle_adjustment_diagnostics = None
 
         global_transforms[0] = np.eye(3)
         placement_scores[0] = 1e9
@@ -188,7 +191,6 @@ class GridMode(BaseStitchMode):
                                     global_transforms, placement_scores,
                                     cancel_cb, progress_cb) -> int:
 
-        allow_rotation = not bool(getattr(self.profile, "lock_rotation", False))
         skipped: int = 0
 
         def _normalize_candidate(candidate):
@@ -209,6 +211,7 @@ class GridMode(BaseStitchMode):
             current_row, current_col = self._slot_row_col(current_slot)
 
             best_candidate = None
+            candidates = []
             step1_candidate = None
             step1_ref_idx = None
             step1_relation = None
@@ -229,7 +232,7 @@ class GridMode(BaseStitchMode):
                         candidate = self._pair_global(
                             ref_idx, current_index, relation,
                             global_transforms, features, images,
-                            allow_rotation, cancel_cb, progress_cb,
+                            cancel_cb, progress_cb,
                             return_source=True,
                         )
                         candidate = _normalize_candidate(candidate)
@@ -240,8 +243,6 @@ class GridMode(BaseStitchMode):
 
             # Step 2: broaden to already-placed grid neighbors.
             if best_candidate is None:
-
-                candidates = []
                 if step1_candidate is not None:
                     candidates.append(step1_candidate)
 
@@ -269,7 +270,7 @@ class GridMode(BaseStitchMode):
                     candidate = self._pair_global(
                         ref_scan_idx, current_index, relation,
                         global_transforms, features, images,
-                        allow_rotation, cancel_cb, progress_cb,
+                        cancel_cb, progress_cb,
                         return_source=True,
                     )
                     candidate = _normalize_candidate(candidate)
@@ -278,16 +279,22 @@ class GridMode(BaseStitchMode):
                         candidates.append(candidate)
 
                 if candidates:
+                    self._record_bundle_candidates(current_index, candidates, global_transforms)
                     non_nominal_candidates = [candidate for candidate in candidates if candidate[2] != "nominal"]
                     ranked_candidates = non_nominal_candidates if non_nominal_candidates else candidates
                     ranked_candidates.sort(key=lambda x: float(x[1]), reverse=True)
                     best_candidate = ranked_candidates[0]
 
+            if best_candidate is not None and not candidates:
+                self._record_bundle_candidates(current_index, [best_candidate], global_transforms)
+
             # Finalize the chosen candidate for this image.
             if best_candidate is None:
                 skipped += 1
                 self._record_panel_source(current_index, "skipped")
-                emit_msg(f"Skipping {os.path.basename(names[current_index])} (no valid transform)", "red", progress_cb)
+                file_name = os.path.basename(names[current_index])
+                emit_msg(f"Skipping {first_and_last_part(file_name, DISPLAY_NAME_SIZE)} (no valid transform)",
+                         "red", progress_cb)
                 continue
 
             chosen_transform, chosen_score, chosen_source, chosen_meta = best_candidate
@@ -310,6 +317,98 @@ class GridMode(BaseStitchMode):
                 )
 
         return skipped
+
+    def _record_bundle_candidates(self, image_index, candidates, global_transforms):
+        if not hasattr(self, "_bundle_candidates") or image_index >= len(self._bundle_candidates):
+            return
+        bucket = self._bundle_candidates[image_index]
+        seen_signatures = {
+            (
+                int(candidate.ref_index),
+                round(float(candidate.score), 6),
+                candidate.source,
+                tuple(np.asarray(candidate.relative_transform, dtype=np.float64).round(6).ravel()),
+            )
+            for candidate in bucket
+        }
+        for candidate in candidates or []:
+            if candidate is None or len(candidate) < 4:
+                continue
+            transform = candidate[0]
+            score = candidate[1]
+            source = candidate[2]
+            meta = candidate[3] if isinstance(candidate[3], dict) else None
+            if source == "nominal" or transform is None:
+                continue
+            ref_index = int(meta.get("ref_idx", -1)) if meta is not None else -1
+            if ref_index < 0 or ref_index >= len(global_transforms):
+                continue
+            ref_transform = global_transforms[ref_index]
+            if ref_transform is None:
+                continue
+            matrix = np.asarray(transform, dtype=np.float64)
+            if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+                continue
+            try:
+                relative_transform = np.linalg.inv(np.asarray(ref_transform, dtype=np.float64)) @ matrix
+            except np.linalg.LinAlgError:
+                continue
+            signature = (
+                ref_index,
+                round(float(score), 6),
+                str(source),
+                tuple(np.asarray(relative_transform, dtype=np.float64).round(6).ravel()),
+            )
+            if signature in seen_signatures:
+                continue
+            bucket.append(
+                BundleAdjustmentEdge(
+                    ref_index=ref_index,
+                    image_index=image_index,
+                    relative_transform=np.asarray(relative_transform, dtype=np.float64).copy(),
+                    score=float(score),
+                    source=str(source),
+                )
+            )
+            seen_signatures.add(signature)
+
+    def _refine_global_transforms(self, global_transforms, progress_cb=None):
+        mode = str(getattr(cfg.state.ssm, "bundle_adjustment_mode", "off") or "off").strip().lower()
+        self.last_bundle_adjustment_diagnostics = BundleAdjustmentDiagnostics(
+            mode=mode if mode else "off",
+            edge_count=0,
+            adjusted_panels=0,
+            mean_translation_shift_px=0.0,
+            max_translation_shift_px=0.0,
+            iterations=0,
+            status="disabled" if mode == "off" else "pending",
+        )
+        if mode == "off":
+            return global_transforms
+        try:
+            refined, diagnostics = refine_global_transforms(global_transforms, self._bundle_candidates, mode=mode)
+        except Exception:
+            logger.debug("Bundle refinement failed; keeping original transforms", exc_info=True)
+            self.last_bundle_adjustment_diagnostics = BundleAdjustmentDiagnostics(
+                mode=mode,
+                edge_count=0,
+                adjusted_panels=0,
+                mean_translation_shift_px=0.0,
+                max_translation_shift_px=0.0,
+                iterations=0,
+                status="error",
+            )
+            return global_transforms
+        self.last_bundle_adjustment_diagnostics = diagnostics
+        if diagnostics.status == "ok":
+            emit_msg(
+                f"Bundle refinement applied: mode={mode}, edges={diagnostics.edge_count}, adjusted={diagnostics.adjusted_panels}, mean_shift={diagnostics.mean_translation_shift_px:.2f}px, max_shift={diagnostics.max_translation_shift_px:.2f}px",
+                "debug",
+                progress_cb,
+            )
+        else:
+            emit_msg(f"Bundle refinement skipped: mode={mode}, status={diagnostics.status}", "debug", progress_cb)
+        return refined
 
     # -------------------------
     # RELATION
@@ -334,7 +433,7 @@ class GridMode(BaseStitchMode):
     # -------------------------
 
     def _pair_global(self, ref_idx, cur_idx, relation, global_h,
-                     features, images, allow_rotation, cancel_cb, progress_cb=None,
+                     features, images, cancel_cb, progress_cb=None,
                      return_source=False):
         enable_grid_phase_fallback = cfg.state.ssm.enable_grid_phase_fallback  
         grid_phase_fallback_min_response = cfg.state.ssm.grid_guide.grid_phase_fallback_min_response  # 0.02
@@ -351,7 +450,6 @@ class GridMode(BaseStitchMode):
         local_transform, inlier_mask, feature_metrics = self._match_feature_pair_with_metrics(
             ref_keypoints, ref_descriptors, ref_scale,
             cur_keypoints, cur_descriptors, cur_scale,
-            allow_rotation=allow_rotation,
             ref_image=images[ref_idx],
             current_image=images[cur_idx],
         )
@@ -388,7 +486,7 @@ class GridMode(BaseStitchMode):
                 return None
 
             score = int(round(response * 1000.0))
-            return global_h[ref_idx] @ phase_local_transform, score, "phase"
+            return global_h[ref_idx] @ phase_local_transform, score, "phase", {"ref_idx": ref_idx}
 
         # Prefer phase early only when the pair looks weak-texture and the
         # feature path did not already produce a usable transform.
@@ -460,7 +558,7 @@ class GridMode(BaseStitchMode):
             if global_h[i] is None:
                 continue
 
-            emit_msg(f"{names[i]}", "panel", progress_cb)
+            emit_msg(f"{first_and_last_part(names[i], DISPLAY_NAME_SIZE)}", "panel", progress_cb)
             if progress_cb:
                 try:
                     progress_cb(i, n)
@@ -476,6 +574,7 @@ class GridMode(BaseStitchMode):
                 placement_score=placement_score[i],
                 min_blend_score=float(cfg.state.ssm.grid_guide.grid_min_blend_score),
                 max_allowed_size=GRID_MODE_MAX_WARP_DIM,
+                max_allowed_pixels=GRID_MODE_MAX_WARP_PIXELS,
                 cancel_cb=cancel_cb,
                 progress_cb=progress_cb
             )

@@ -68,7 +68,7 @@ def integer_content_bit_depth(img: np.ndarray, filename: str) -> int:
     if arr.dtype == np.uint32:
         if max_val <= 16_777_215:
             return 24
-        raise ValueError(f"{filename}: uint32 max {max_val} exceeds 24-bit mono range")
+        return 32
     if arr.dtype in (np.int16, np.int32, np.int64):
         # Consider both positive and negative ranges for signed integer inputs.
         signed_abs_max = max(abs(min_val), abs(max_val))

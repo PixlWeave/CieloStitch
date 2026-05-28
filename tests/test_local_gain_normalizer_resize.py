@@ -8,7 +8,7 @@
 
 import numpy as np
 
-from cielostitch_core.core.stitching.local_gain_normalizer import LocalGainNormalizer
+from cielostitch_core.stitching.local_gain_normalizer import LocalGainNormalizer
 
 
 def test_resize_image_supports_float16_without_opencv_assertion():

@@ -7,3 +7,5 @@
 # Licensed under the MIT License.
 # See the LICENSE file for details.
 
+from .simple_engine import run_simple_engine
+

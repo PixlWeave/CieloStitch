@@ -63,4 +63,5 @@ class LunarProfile:
     min_inliers = 10
     # Note: UI also exposes detector_downscale under Feature Matching; value shared with detection.
     # Prohibit rotation in transform solve when True; stabilizes grid mosaics on tracking mounts.
-    lock_rotation = False
+    # Transform model for feature matching: 'auto', 'affine', 'homography', 'translation'
+    transform_mode = "affine"

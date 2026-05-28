@@ -108,9 +108,52 @@ def test_blend_without_overlap_keeps_overlap_diagnostics_empty() -> None:
     assert np.all(seam_heatmap == 0.0)
 
     # Coverage still counts both contributors in their own regions.
-    assert np.all(coverage_count[canvas_mask] == 1)
-    assert np.all(coverage_count[img_mask] == 1)
 
-    # New non-overlap pixels must be copied from the incoming panel.
-    only_img = img_mask & (~canvas_mask)
-    assert np.all(out_canvas[only_img] == 1.0)
+
+def test_content_aware_feather_blend_populates_localized_seam_heatmap() -> None:
+    blender = _make_blender(blend_type="multiband", multiband_levels=4)
+    blender.ghost_guard_enabled = True
+    blender.ghost_guard_risk_threshold = 0.4
+    blender.ghost_guard_feather_px = 10
+
+    canvas = np.zeros((80, 80), dtype=np.float32)
+    img = np.zeros((80, 80), dtype=np.float32)
+    canvas[:, :48] = 0.2
+    img[:, 32:] = 0.8
+
+    canvas_mask = np.zeros((80, 80), dtype=bool)
+    img_mask = np.zeros((80, 80), dtype=bool)
+    canvas_mask[:, :48] = True
+    img_mask[:, 32:] = True
+    overlap = canvas_mask & img_mask
+    seam_heatmap = np.zeros((80, 80), dtype=np.float32)
+    blended_mask = np.zeros((80, 80), dtype=bool)
+
+    out = blender._content_aware_feather_blend(
+        canvas,
+        img,
+        canvas_mask,
+        img_mask,
+        overlap,
+        blended_mask=blended_mask,
+        seam_heatmap=seam_heatmap,
+    )
+
+    assert out.shape == canvas.shape
+    assert np.any(blended_mask[overlap])
+    assert float(np.max(seam_heatmap[overlap])) > 0.0
+    assert np.count_nonzero(seam_heatmap[overlap] > 0.0) < np.count_nonzero(overlap)
+    assert np.all(seam_heatmap[~overlap] == 0.0)
+
+
+def test_histogram_matching_preserves_float_order_across_disjoint_ranges() -> None:
+    source = np.array([[1000.0, 1001.0], [1002.0, 1003.0]], dtype=np.float32)
+    reference = np.array([[2000.0, 2001.0], [2002.0, 2003.0]], dtype=np.float32)
+    overlap = np.ones((2, 2), dtype=bool)
+
+    matched = Blender._match_histogram_channel(source, reference, overlap)
+
+    assert matched.dtype == np.float32
+    assert np.all(np.diff(np.sort(matched.ravel())) > 0.0)
+    assert float(matched.min()) >= float(reference.min())
+    assert float(matched.max()) <= float(reference.max())

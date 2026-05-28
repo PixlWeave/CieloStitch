@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cielostitch-core"
-version = "0.4.50"
+version = "0.5.00"
 description = "Core stitching engine for CieloStitch"
 readme = "README.md"
 license = "MIT"

@@ -12,20 +12,19 @@ from dataclasses import dataclass
 
 from ..state.preferences import AppPreferences
 from ..state.state_manager import AppStateManager
-from ..config.constants import DEFAULT_MESSAGE_COLORS
+from ..config.constants import DEFAULT_MESSAGE_COLORS_STR
 
 
 def _build_allowed_message_colors(raw: str | None) -> set[str]:
     parts = {part.strip().lower() for part in str(raw or "").split(",") if part.strip()}
-    # all keys: red,green,blue,debug,panel,default/none/""
-    return parts or DEFAULT_MESSAGE_COLORS # "panel", "none", ""
+    return parts or {}
 
 @dataclass
 class Config:
     def __init__(self) -> None:
         self.prefs = AppPreferences.load()
         self.allowed_message_colors = _build_allowed_message_colors(
-            getattr(self.prefs, "log_message_colors", "default,red,yellow,green,debug")
+            getattr(self.prefs, "log_message_colors", DEFAULT_MESSAGE_COLORS_STR)
         )
         self.state = AppStateManager(self.prefs)
         self.apply_log_level()

@@ -29,7 +29,7 @@ Thumbs.db
 Desktop.ini
 
 # Jekyll local build artifacts
-_site/
+_site_delete/
 _delete/
 _delete/.jekyll-cache/
 .jekyll-metadata

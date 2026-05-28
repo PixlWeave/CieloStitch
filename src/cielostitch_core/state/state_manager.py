@@ -25,11 +25,13 @@ Changes to states emit signals that can be observed by UI coordinators.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Dict, Any, Optional
 from PySide6.QtCore import Signal
 from PySide6.QtCore import QObject
 
 from ..config.constants import SPEED_PRESETS
+from ..core.session_resolver import ResolverInputs
 from ..state.preferences import AppPreferences
 from .session_model import SessionModel
 from .profile_model import ProfileModel
@@ -48,6 +50,7 @@ class AppStateManager(QObject):
     - UI: preview modes, zoom mode
     """
 
+    engineChanged = Signal()
     profileChanged = Signal()  # profile name
     stitchModeChanged = Signal() # stitch_mode name
     settingsFileChanged = Signal()
@@ -57,6 +60,7 @@ class AppStateManager(QObject):
         self._window = parent
         prefs = prefs or AppPreferences.load()
 
+        self._engine: str = "cielo"
         self._profile = prefs.default_profile
         self._stitch_mode: str = prefs.default_stitch_mode
         # Profile states and Session states
@@ -66,7 +70,7 @@ class AppStateManager(QObject):
         # Stitching states
         self._is_running: bool = False
         self._last_resolved_values: Dict[str, Any] = {}
-        self._last_resolve_inputs: Dict[str, Any] = {}
+        self._last_resolved_inputs: Dict[str, Any] = {}
         self._is_resolved: bool = False
         self._show_pixel_stat: bool = True
         self._cli_mode: bool = False
@@ -76,6 +80,16 @@ class AppStateManager(QObject):
         # Saved Settings states
         self._open_project_file: Optional[str] = None
         self._open_profile: Optional[str] = None
+        self._open_stitch_mode: Optional[str] = None
+
+    def init_state(self):
+        self.psm.set_default_values(self.profile)
+        self.psm.clear_dirty(self.profile)
+        self.ssm.set_default_values()
+        self.ssm.clear_dirty()
+        self.last_resolved_values = {}
+        self.last_resolved_inputs = {}
+        self.is_resolved = False
 
     def find(self, field_name) -> ProfileModel | SessionModel | AppStateManager | None:
         # get a handle of psm or ssm or ap_state that contains the field
@@ -108,6 +122,62 @@ class AppStateManager(QObject):
             found.set_value(field_name, value)
             return
 
+    def build_resolver_inputs(
+            self,
+            *,
+            panel_w: int,
+            panel_h: int,
+            panel_count: int,
+            bit_depth: int,
+    ) -> ResolverInputs:
+        return ResolverInputs(
+            subject=self.profile,
+            panel_w=int(panel_w),
+            panel_h=int(panel_h),
+            panel_count=int(panel_count),
+            overlap_x_pct=float(self.ssm.overlap_x_pct),
+            overlap_y_pct=float(self.ssm.overlap_y_pct),
+            fpx_mode=getattr(self.ssm, "fpx_mode", None),
+            focal_length_mm=getattr(self.ssm, "focal_length_mm", 0.0),
+            sensor_width_mm=getattr(self.ssm, "sensor_width_mm", 0.0),
+            sensor_height_mm=getattr(self.ssm, "sensor_height_mm", 0.0),
+            hfov_deg=getattr(self.ssm, "hfov_deg", 0.0),
+            fpx_factor=getattr(self.ssm, "fpx_factor", 1.5),
+            camera_angle_deg=getattr(self.ssm, "camera_angle_deg", 0.0),
+            stitch_mode=self.stitch_mode,
+            mount_precision=self.ssm.mount_precision,
+            bit_depth=int(bit_depth),
+            speed_preset=self.speed_preset,
+        )
+
+    def build_resolver_input_snapshot(
+            self,
+            *,
+            panel_w: int,
+            panel_h: int,
+            panel_count: int,
+            bit_depth: int,
+    ) -> Dict[str, Any]:
+        return asdict(
+            self.build_resolver_inputs(
+                panel_w=panel_w,
+                panel_h=panel_h,
+                panel_count=panel_count,
+                bit_depth=bit_depth,
+            )
+        )
+
+    @property
+    def engine(self) -> str:
+        return self._engine
+
+    @engine.setter
+    def engine(self, value: str) -> None:
+        normalized = str(value or "cielo").strip().lower() or "cielo"
+        if self._engine != normalized:
+            self._engine = normalized
+            self.engineChanged.emit()
+
     @property
     def profile(self) -> str:
         return self._profile
@@ -120,7 +190,7 @@ class AppStateManager(QObject):
             self.psm.current_profile = value
             # Invalidate resolve snapshot — resolved values belong to the old profile.
             self._last_resolved_values = {}
-            self._last_resolve_inputs = {}
+            self._last_resolved_inputs = {}
             self.profileChanged.emit()
 
     # === Stitching State ===
@@ -172,11 +242,12 @@ class AppStateManager(QObject):
     def open_profile(self) -> Optional[str]:
         return self._open_profile
 
-    def set_open_settings_file(self, path: str | None, profile: str | None) -> None:
+    def set_open_settings_file(self, path: str | None, profile: str | None, stitch_mode: str | None) -> None:
         changed = (self._open_project_file != path) or (self._open_profile != profile)
         if changed:
             self._open_project_file = path
             self._open_profile = profile
+            self._open_stitch_mode = stitch_mode
             self.settingsFileChanged.emit()
 
     @property
@@ -210,9 +281,9 @@ class AppStateManager(QObject):
         self._last_resolved_values = value
 
     @property
-    def last_resolve_inputs(self) -> Dict[str, Any]:
-        return self._last_resolve_inputs
+    def last_resolved_inputs(self) -> Dict[str, Any]:
+        return self._last_resolved_inputs
 
-    @last_resolve_inputs.setter
-    def last_resolve_inputs(self, value: Dict[str, Any]) -> None:
-        self._last_resolve_inputs = value
+    @last_resolved_inputs.setter
+    def last_resolved_inputs(self, value: Dict[str, Any]) -> None:
+        self._last_resolved_inputs = value

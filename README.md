@@ -4,7 +4,7 @@ Core stitching engine for CieloStitch.
 
 CieloStitch Core is the reusable Python package behind the CieloStitch desktop app. It provides the stitching pipeline, subject-aware defaults, image I/O, session parameter resolution, and the command-line entry point for building mosaics from overlapping panels.
 
-It is a homography-based panel stitcher, not a WCS-aware reprojection or plate-solving engine, so it works best on overlapping panels with moderate field-of-view change rather than very wide-field or all-sky projection workflows.
+It is a panel stitcher built around translation, affine, homography, and APAP based local warping, rather than a WCS-aware reprojection or plate-solving engine. So it works best on overlapping panels with moderate field-of-view change rather than very wide-field or all-sky projection workflows.
 
 It is designed for astrophotography and landscape workflows such as solar, solar H-alpha, lunar, milky way, nightscape, landscape, and general multi-panel mosaics.
 
@@ -102,7 +102,7 @@ cielostitch-cli ./panels \
 ```python
 from pathlib import Path
 
-from cielostitch_core.core.stitching.free_mode import FreeMode
+from cielostitch_core.stitching.free_mode import FreeMode
 from cielostitch_core.state.profiles import GeneralProfile
 from cielostitch_core.utils.image_io import load_panel_images_from_paths, save_image
 from cielostitch_core.utils.image_manipulation import from_internal_float32

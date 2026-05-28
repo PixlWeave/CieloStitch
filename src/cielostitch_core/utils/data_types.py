@@ -14,8 +14,8 @@ import numpy as np
 import math
 
 def is_val_equal(a, b):
-    if isinstance(a, float) and isinstance(b, float):
-        return math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-9)
+    if isinstance(a, (float, np.floating)) and isinstance(b, (float, np.floating)):
+        return math.isclose(float(a), float(b), rel_tol=1e-6, abs_tol=1e-9)
     return a == b
 
 def as_str(value: Any, default: str) -> str:

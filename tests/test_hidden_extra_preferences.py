@@ -43,6 +43,21 @@ def test_hidden_subpixel_preference_uses_legacy_extra_as_fallback(monkeypatch):
     assert prefs.enable_subpixel_refinement is False
 
 
+def test_developer_mode_preference_loads_from_extra_namespace(monkeypatch):
+    values = {
+        "extra/developer_mode": "true",
+    }
+
+    def fake_read_pref(key, default=None, value_type=None, type=None):
+        return values.get(key, default)
+
+    monkeypatch.setattr("cielostitch_core.state.preferences.read_pref", fake_read_pref)
+
+    prefs = AppPreferences.load()
+
+    assert prefs.developer_mode is True
+
+
 def test_message_color_passed_uses_hidden_allowlist(monkeypatch):
     prefs = AppPreferences(log_message_colors="default,panel")
 
@@ -104,3 +119,18 @@ def test_candidate_debug_preference_saves_to_stitch_namespace(monkeypatch):
     prefs.save()
 
     assert writes.get("stitch/enable_candidate_debug") is True
+
+
+def test_developer_mode_preference_saves_to_extra_namespace(monkeypatch):
+    writes = {}
+
+    def fake_write_pref(key, value):
+        writes[key] = value
+
+    monkeypatch.setattr("cielostitch_core.state.preferences.write_pref", fake_write_pref)
+    monkeypatch.setattr("cielostitch_core.state.preferences.sync_prefs", lambda: None)
+
+    prefs = AppPreferences(developer_mode=True)
+    prefs.save()
+
+    assert writes.get("extra/developer_mode") is True

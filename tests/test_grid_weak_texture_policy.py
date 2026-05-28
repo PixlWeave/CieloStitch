@@ -9,8 +9,9 @@
 import numpy as np
 
 from cielostitch_core.config.config import cfg
-from cielostitch_core.core.stitching.base_mode import BaseStitchMode
-from cielostitch_core.core.stitching.grid_mode import GridMode
+from cielostitch_core.core.bundle import BundleAdjustmentEdge, refine_global_transforms
+from cielostitch_core.stitching.base_mode import BaseStitchMode
+from cielostitch_core.stitching.grid_mode import GridMode
 
 
 class _MatcherStub:
@@ -59,7 +60,7 @@ def test_grid_stitch_disables_detection_in_deterministic_mode(monkeypatch):
     monkeypatch.setattr(grid, "_warp_and_blend_panels", lambda *args, **kwargs: None)
     monkeypatch.setattr(grid, "_sync_random_counters", lambda *args, **kwargs: None)
     monkeypatch.setattr(grid, "_finalize_stitch", lambda *args, **kwargs: (None, None, None))
-    monkeypatch.setattr("cielostitch_core.core.stitching.grid_mode.MosaicCanvas", lambda *args, **kwargs: object())
+    monkeypatch.setattr("cielostitch_core.stitching.grid_mode.MosaicCanvas", lambda *args, **kwargs: object())
 
     image_items = [("img0", np.zeros((64, 64), dtype=np.float32))]
     grid.stitch(image_items, progress_cb=None, cancel_cb=None)
@@ -135,7 +136,7 @@ def test_grid_pair_prefers_phase_for_weak_texture(monkeypatch):
     images = [np.zeros((128, 128), dtype=np.float32), np.zeros((128, 128), dtype=np.float32)]
     global_h = [np.eye(3), None]
 
-    result = grid._pair_global(0, 1, "left", global_h, features, images, False, None)
+    result = grid._pair_global(0, 1, "left", global_h, features, images, cancel_cb=None, progress_cb=None)
 
     assert result is not None
     h, score = result
@@ -177,7 +178,7 @@ def test_grid_pair_keeps_feature_path_when_evidence_is_healthy(monkeypatch):
     images = [np.zeros((128, 128), dtype=np.float32), np.zeros((128, 128), dtype=np.float32)]
     global_h = [np.eye(3), None]
 
-    result = grid._pair_global(0, 1, "left", global_h, features, images, False, None)
+    result = grid._pair_global(0, 1, "left", global_h, features, images, cancel_cb=None, progress_cb=None)
 
     assert result is not None
     h, score = result
@@ -220,7 +221,7 @@ def test_grid_pair_keeps_feature_match_even_when_counts_look_weak(monkeypatch):
     images = [np.zeros((128, 128), dtype=np.float32), np.zeros((128, 128), dtype=np.float32)]
     global_h = [np.eye(3), None]
 
-    result = grid._pair_global(0, 1, "left", global_h, features, images, False, None)
+    result = grid._pair_global(0, 1, "left", global_h, features, images, cancel_cb=None, progress_cb=None)
 
     assert result is not None
     h, score = result
@@ -429,3 +430,171 @@ def test_grid_mode_records_subpixel_count_once_for_chosen_panel(monkeypatch):
     assert skipped == 0
     assert grid._subpixel_refinement_keys == {2}
     assert placement_scores[2] == 9
+
+
+def test_refine_global_transforms_translation_averages_candidates() -> None:
+    global_transforms = [
+        np.eye(3),
+        np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 4.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+    ]
+    candidate_groups = [
+        [],
+        [
+            BundleAdjustmentEdge(
+                0,
+                1,
+                np.array([[1.0, 0.0, 12.0], [0.0, 1.0, 6.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+                8.0,
+                "feature",
+            ),
+            BundleAdjustmentEdge(
+                0,
+                1,
+                np.array([[1.0, 0.0, 8.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+                8.0,
+                "phase",
+            ),
+        ],
+    ]
+
+    refined, diagnostics = refine_global_transforms(global_transforms, candidate_groups, mode="translation")
+
+    assert refined[1] is not None
+    assert float(refined[1][0, 2]) == 10.0
+    assert float(refined[1][1, 2]) == 4.0
+    assert diagnostics.edge_count == 2
+    assert diagnostics.status == "ok"
+
+
+def test_grid_mode_bundle_refinement_off_keeps_original_transforms(monkeypatch):
+    grid = object.__new__(GridMode)
+    grid._bundle_candidates = [[], [], []]
+    grid.last_bundle_adjustment_diagnostics = None
+
+    monkeypatch.setattr(cfg.state.ssm, "bundle_adjustment_mode", "off")
+
+    original = [
+        np.eye(3),
+        np.array([[1.0, 0.0, 5.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+        np.array([[1.0, 0.0, 7.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+    ]
+
+    refined = grid._refine_global_transforms(original, progress_cb=None)
+
+    assert np.array_equal(refined[1], original[1])
+    assert np.array_equal(refined[2], original[2])
+    assert grid.last_bundle_adjustment_diagnostics is not None
+    assert grid.last_bundle_adjustment_diagnostics.status == "disabled"
+
+
+def test_grid_mode_bundle_refinement_affine_blends_candidate_transform(monkeypatch):
+    grid = object.__new__(GridMode)
+    grid._bundle_candidates = [
+        [],
+        [
+            BundleAdjustmentEdge(
+                0,
+                1,
+                np.array([[1.0, 0.1, 8.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+                10.0,
+                "feature",
+            )
+        ],
+    ]
+    grid.last_bundle_adjustment_diagnostics = None
+
+    monkeypatch.setattr(cfg.state.ssm, "bundle_adjustment_mode", "affine")
+
+    original = [
+        np.eye(3),
+        np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 4.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+    ]
+
+    refined = grid._refine_global_transforms(original, progress_cb=None)
+
+    assert refined[1] is not None
+    assert float(refined[1][0, 1]) > 0.0
+    assert 8.0 < float(refined[1][0, 2]) < 10.0
+    assert grid.last_bundle_adjustment_diagnostics is not None
+    assert grid.last_bundle_adjustment_diagnostics.status == "ok"
+    assert grid.last_bundle_adjustment_diagnostics.edge_count == 1
+
+
+def test_refine_global_transforms_affine_handles_reverse_edge_direction() -> None:
+    global_transforms = [
+        np.eye(3),
+        np.array([[1.0, 0.0, 11.0], [0.0, 1.0, 5.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+        np.array([[1.0, 0.1, 18.0], [0.0, 1.0, 6.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+    ]
+    candidate_groups = [
+        [],
+        [
+            BundleAdjustmentEdge(
+                1,
+                2,
+                np.array([[1.0, 0.1, 8.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+                10.0,
+                "feature",
+            )
+        ],
+        [],
+    ]
+
+    refined, diagnostics = refine_global_transforms(global_transforms, candidate_groups, mode="affine")
+
+    assert refined[0] is not None and refined[1] is not None and refined[2] is not None
+    expected_reverse = global_transforms[2] @ np.linalg.inv(
+        np.array([[1.0, 0.1, 8.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    )
+    assert np.allclose(refined[0], np.eye(3))
+    assert np.linalg.norm(refined[1][:2, :] - expected_reverse[:2, :]) < np.linalg.norm(
+        global_transforms[1][:2, :] - expected_reverse[:2, :]
+    )
+    assert diagnostics.status == "ok"
+
+
+def test_refine_global_transforms_skips_out_of_range_edges() -> None:
+    global_transforms = [
+        np.eye(3),
+        np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+    ]
+
+    refined, diagnostics = refine_global_transforms(
+        global_transforms,
+        [[BundleAdjustmentEdge(99, 1, np.eye(3, dtype=np.float64), 10.0, "feature")]],
+        mode="translation",
+    )
+
+    assert np.array_equal(refined[0], global_transforms[0])
+    assert np.array_equal(refined[1], global_transforms[1])
+    assert diagnostics.edge_count == 0
+    assert diagnostics.status == "no_edges"
+
+
+def test_refine_global_transforms_translation_reduces_chain_drift() -> None:
+    global_transforms = [
+        np.eye(3),
+        np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+        np.array([[1.0, 0.0, 23.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+        np.array([[1.0, 0.0, 36.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64),
+    ]
+    candidate_groups = [
+        [],
+        [BundleAdjustmentEdge(0, 1, np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64), 10.0, "feature")],
+        [
+            BundleAdjustmentEdge(1, 2, np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64), 10.0, "feature"),
+            BundleAdjustmentEdge(0, 2, np.array([[1.0, 0.0, 20.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64), 12.0, "feature"),
+        ],
+        [
+            BundleAdjustmentEdge(2, 3, np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64), 10.0, "feature"),
+            BundleAdjustmentEdge(1, 3, np.array([[1.0, 0.0, 20.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64), 12.0, "feature"),
+        ],
+    ]
+
+    refined, diagnostics = refine_global_transforms(global_transforms, candidate_groups, mode="translation")
+
+    assert refined[2] is not None and refined[3] is not None
+    assert abs(float(refined[2][0, 2]) - 20.0) < abs(float(global_transforms[2][0, 2]) - 20.0)
+    assert abs(float(refined[3][0, 2]) - 30.0) < abs(float(global_transforms[3][0, 2]) - 30.0)
+    assert diagnostics.adjusted_panels >= 2
+    assert diagnostics.max_translation_shift_px > 0.0

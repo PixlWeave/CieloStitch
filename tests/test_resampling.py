@@ -34,6 +34,15 @@ def test_is_integer_translation_and_warp_choice():
     assert pre is None
 
 
+def test_is_integer_translation_rejects_projective_terms():
+    H = np.eye(3, dtype=np.float64)
+    H[0, 2] = 3.0
+    H[1, 2] = -2.0
+    H[2, 0] = 2.5e-4
+
+    assert not is_integer_translation(H)
+
+
 def test_strong_downscale_prefilter():
     # 0.5 scale on x-axis
     H = np.array([[0.5, 0.0, 0.0],

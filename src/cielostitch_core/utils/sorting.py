@@ -20,10 +20,11 @@ def natural_sort_key(name: str):
         if not part:
             continue
         if part.isdigit():
-            key.append(int(part))
+            # Prefix token type to keep mixed numeric/text keys comparable.
+            key.append((0, int(part)))
         else:
-            key.append(part.lower())
-    return key
+            key.append((1, part.lower()))
+    return tuple(key)
 
 
 def sort_panel_paths(paths: List[str], option: str) -> List[str]:

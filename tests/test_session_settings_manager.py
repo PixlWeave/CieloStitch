@@ -32,6 +32,12 @@ def test_initialization_uses_preferences_defaults() -> None:
 
     assert manager.current_stitch_mode == "grid-guided"
     assert manager.grid_cols == 3
+    assert manager.bundle_adjustment_mode == "off"
+    assert manager.projection_mode == "native"
+    assert manager.focal_length_mm == 0.0
+    assert manager.sensor_width_mm == 0.0
+    assert manager.sensor_height_mm == 0.0
+    assert manager.camera_angle_deg == 0.0
     assert manager.is_modified() is False
 
 
@@ -108,6 +114,7 @@ def test_set_values_from_dict_replaces_state() -> None:
             "overlap_y_pct": 30.0,
             "staged_matching_mode": "manual",
             "refs_per_stage": 4,
+            "bundle_adjustment_mode": "affine",
             "enable_grid_phase_fallback": False,
             "enable_grid_nominal_fallback": False,
             "enable_grid_shift_guard": False,
@@ -131,6 +138,7 @@ def test_set_values_from_dict_replaces_state() -> None:
     assert manager.overlap_x_pct == 25.0
     assert manager.overlap_y_pct == 30.0
     assert manager.staged_matching_mode == "manual"
+    assert manager.bundle_adjustment_mode == "affine"
     assert manager.enable_grid_phase_fallback is False
     assert manager.enable_grid_nominal_fallback is False
     assert manager.enable_grid_shift_guard is False
@@ -206,6 +214,8 @@ def test_set_default_values_resets_state_and_clears_dirty() -> None:
 
     manager.set_value("grid_cols", 10)
     manager.set_value("scan_order", "column-wise")
+    manager.set_value("projection_mode", "cylindrical")
+    manager.set_value("focal_length_mm", 24.0)
     assert manager.is_modified() is True
 
     manager.set_default_values()
@@ -221,9 +231,15 @@ def test_set_default_values_resets_state_and_clears_dirty() -> None:
     assert manager.overlap_y_pct == 20.0
     assert manager.staged_matching_mode == "auto"
     assert manager.refs_per_stage == 6
+    assert manager.bundle_adjustment_mode == "off"
     assert manager.enable_grid_phase_fallback is True
     assert manager.enable_grid_nominal_fallback is True
     assert manager.enable_grid_shift_guard is True
+    assert manager.projection_mode == "native"
+    assert manager.focal_length_mm == 0.0
+    assert manager.sensor_width_mm == 0.0
+    assert manager.sensor_height_mm == 0.0
+    assert manager.camera_angle_deg == 0.0
     assert manager.is_modified() is False
 
 
@@ -231,6 +247,14 @@ def test_to_dict_and_from_dict_round_trip() -> None:
     manager = make_manager()
     manager.set_value("grid_cols", 9)
     manager.set_value("scan_order", "column-wise")
+    manager.set_value("projection_mode", "cylindrical")
+    manager.set_value("bundle_adjustment_mode", "translation")
+    manager.set_value("fpx_mode", "camera")
+    manager.set_value("focal_length_mm", 28.0)
+    manager.set_value("sensor_width_mm", 36.0)
+    manager.set_value("sensor_height_mm", 24.0)
+    manager.set_value("camera_angle_deg", 90.0)
+    manager.set_value("simple_engine_timeout_sec", 900)
     manager.grid_guide.grid_expected_shift_tolerance = 0.33
 
     snapshot = manager.to_dict()
@@ -240,9 +264,102 @@ def test_to_dict_and_from_dict_round_trip() -> None:
 
     assert restored.grid_cols == 9
     assert restored.scan_order == "column-wise"
+    assert restored.projection_mode == "cylindrical"
+    assert restored.bundle_adjustment_mode == "translation"
+    assert restored.focal_length_mm == 28.0
+    assert restored.sensor_width_mm == 36.0
+    assert restored.sensor_height_mm == 24.0
+    assert restored.camera_angle_deg == 90.0
+    assert restored.simple_engine_timeout_sec == 900
     assert restored.grid_guide.grid_expected_shift_tolerance == 0.33
     assert restored.to_dict() == snapshot
     assert restored.is_modified() is False
+
+
+def test_switching_to_camera_mode_preserves_existing_lens_values() -> None:
+    manager = make_manager()
+    manager.set_value("hfov_deg", 42.0)
+    manager.set_value("fpx_factor", 2.5)
+    manager.set_value("fpx_mode", "camera")
+    manager.set_value("focal_length_mm", 28.0)
+    manager.set_value("sensor_width_mm", 36.0)
+    manager.set_value("sensor_height_mm", 24.0)
+    manager.set_value("camera_angle_deg", 90.0)
+
+    assert manager.fpx_mode == "camera"
+    assert manager.focal_length_mm == 28.0
+    assert manager.sensor_width_mm == 36.0
+    assert manager.sensor_height_mm == 24.0
+    assert manager.camera_angle_deg == 90.0
+    assert manager.hfov_deg == 42.0
+    assert manager.fpx_factor == 2.5
+
+
+def test_switching_to_fov_mode_preserves_other_lens_values() -> None:
+    manager = make_manager()
+    manager.set_value("focal_length_mm", 28.0)
+    manager.set_value("sensor_width_mm", 36.0)
+    manager.set_value("sensor_height_mm", 24.0)
+    manager.set_value("camera_angle_deg", 90.0)
+    manager.set_value("fpx_factor", 2.5)
+    manager.set_value("fpx_mode", "fov")
+    manager.set_value("hfov_deg", 42.0)
+
+    assert manager.fpx_mode == "fov"
+    assert manager.hfov_deg == 42.0
+    assert manager.focal_length_mm == 28.0
+    assert manager.sensor_width_mm == 36.0
+    assert manager.sensor_height_mm == 24.0
+    assert manager.camera_angle_deg == 90.0
+    assert manager.fpx_factor == 2.5
+
+
+def test_switching_to_factor_mode_preserves_camera_and_fov_fields() -> None:
+    manager = make_manager()
+    manager.set_value("focal_length_mm", 28.0)
+    manager.set_value("sensor_width_mm", 36.0)
+    manager.set_value("sensor_height_mm", 24.0)
+    manager.set_value("camera_angle_deg", 90.0)
+    manager.set_value("hfov_deg", 42.0)
+    manager.set_value("fpx_factor", 2.5)
+
+    manager.set_value("fpx_mode", "factor")
+
+    assert manager.fpx_mode == "factor"
+    assert manager.fpx_factor == 2.5
+    assert manager.focal_length_mm == 28.0
+    assert manager.sensor_width_mm == 36.0
+    assert manager.sensor_height_mm == 24.0
+    assert manager.camera_angle_deg == 90.0
+    assert manager.hfov_deg == 42.0
+
+
+def test_setting_hfov_value_does_not_switch_mode_or_reset_other_values() -> None:
+    manager = make_manager()
+    manager.set_value("fpx_mode", "camera")
+    manager.set_value("focal_length_mm", 28.0)
+    manager.set_value("sensor_width_mm", 36.0)
+    manager.set_value("fpx_factor", 2.5)
+
+    manager.set_value("hfov_deg", 42.0)
+
+    assert manager.fpx_mode == "camera"
+    assert manager.hfov_deg == 42.0
+    assert manager.fpx_factor == 2.5
+    assert manager.focal_length_mm == 28.0
+    assert manager.sensor_width_mm == 36.0
+
+
+def test_setting_factor_value_does_not_switch_mode_or_reset_fov() -> None:
+    manager = make_manager()
+    manager.set_value("fpx_mode", "fov")
+    manager.set_value("hfov_deg", 42.0)
+
+    manager.set_value("fpx_factor", 2.5)
+
+    assert manager.fpx_mode == "fov"
+    assert manager.fpx_factor == 2.5
+    assert manager.hfov_deg == 42.0
 
 
 def test_from_dict_invalid_data_uses_defaults_and_stays_clean() -> None:
@@ -254,6 +371,7 @@ def test_from_dict_invalid_data_uses_defaults_and_stays_clean() -> None:
             "grid_cols": "invalid",
             "scan_order": None,
             "overlap_x_pct": "bad",
+            "bundle_adjustment_mode": "warp-everything",
             "grid_guide": "not-a-dict",
         }
     )
@@ -261,6 +379,8 @@ def test_from_dict_invalid_data_uses_defaults_and_stays_clean() -> None:
     assert manager.grid_cols == 3
     assert manager.scan_order == "row-wise"
     assert manager.overlap_x_pct == 20.0
+    assert manager.bundle_adjustment_mode == "off"
+    assert manager.simple_engine_timeout_sec == 100
     assert manager.is_modified() is False
 
 

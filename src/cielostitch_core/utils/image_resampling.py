@@ -54,7 +54,10 @@ def is_integer_translation(H: np.ndarray, eps: float = 1e-6) -> bool:
         return False
     a, b, tx = H[0]
     c, d, ty = H[1]
+    p, q, w = H[2]
     if abs(a - 1.0) > eps or abs(d - 1.0) > eps or abs(b) > eps or abs(c) > eps:
+        return False
+    if abs(p) > eps or abs(q) > eps or abs(w - 1.0) > eps:
         return False
     return abs(tx - round(tx)) < eps and abs(ty - round(ty)) < eps
 

@@ -14,15 +14,16 @@ import sys
 from cielostitch_core.config.config import cfg
 from cielostitch_core.config.constants import (
     BLEND_TYPES,
+    ENGINES,
     GAIN_COMPENSATION_OPTIONS,
     NON_GRID_MODES,
     SPEED_PRESETS,
     STITCH_MODES,
-    DEFAULT_MESSAGE_COLORS,
+    DEFAULT_MESSAGE_COLORS_STR,
 )
 from cielostitch_core.core.session_resolver import ResolverInputs, compute_resolved_params
-from cielostitch_core.core.stitching.free_mode import FreeMode
-from cielostitch_core.core.stitching.grid_mode import GridMode
+from cielostitch_core.stitching.free_mode import FreeMode
+from cielostitch_core.stitching.grid_mode import GridMode
 from cielostitch_core.state.profiles import (
     GeneralProfile,
     LandscapeProfile,
@@ -58,7 +59,7 @@ def _print_usage():
     print(
         "cielostitch-cli <image_folder>\n"
         "[--output|-o <output.(tif|tiff|png|jpg|jpeg|bmp|fit|fits|webp|xisf)>]\n"
-        "[--profile|-p <name>] [--stitch-mode|-m auto|freeform|grid-guided|fixed-overlap|zero-overlap]\n"
+        "[--engine|-e auto|simple|cielo] [--profile|-p <name>] [--stitch-mode|-m auto|freeform|grid-guided|fixed-overlap|zero-overlap]\n"
         "[--cols|-c <int>] [--overlap-x-pct|-x <0..100>] [--overlap-y-pct|-y <0..100>]\n"
         "[--blend-type|-b <type>] [--alpha-policy|-a auto|keep|drop|forbid]\n"
         "[--gain-compensation|-g <mode>]\n"
@@ -71,7 +72,8 @@ def _print_usage():
     print(
         "Only image_folder is positional, all other arguments are optional.\n"
         "If omitted, output is auto-saved to image_folder/output with a generated file name.\n"
-        "If not specified, profile='general' and stitch_mode='auto' are hardcoded defaults.\n"
+        "If not specified, profile='general' and stitch_mode='auto' are the defaults.\n"
+        "Engine defaults to preferences when available, otherwise 'cielo'.\n"
         "All other arguments default to preferences.\n"
         "\n"
         "Parameter resolution order (lowest to highest priority):\n"
@@ -92,6 +94,7 @@ def _parse_cli_args(argv):
     output_path = None
 
     profile_arg = None  # None = not explicitly given; resolved in main()
+    engine = None
     stitch_mode = "auto"
     cols = None          # None = not explicitly given; resolved in main()
     overlap_x_pct = None # None = not explicitly given; resolved in main()
@@ -104,6 +107,7 @@ def _parse_cli_args(argv):
     alias_map = {
         "-o": "--output",
         "-p": "--profile",
+        "-e": "--engine",
         "-m": "--stitch-mode",
         "-c": "--cols",
         "-x": "--overlap-x-pct",
@@ -143,6 +147,14 @@ def _parse_cli_args(argv):
 
         if tok_norm == "--profile":
             profile_arg = val_lower
+            i += 1
+            continue
+
+        if tok_norm == "--engine":
+            if val_lower not in ENGINES:
+                print(f"--engine must be one of: {', '.join(ENGINES)}")
+                return None
+            engine = val_lower
             i += 1
             continue
 
@@ -226,6 +238,7 @@ def _parse_cli_args(argv):
     return (
         image_folder,
         output_path,
+        engine,
         profile_arg,
         stitch_mode,
         cols,
@@ -280,6 +293,7 @@ def main():
     (
         image_folder,
         output_path_arg,
+        engine,
         profile_name,
         stitch_mode,
         cols,
@@ -328,6 +342,11 @@ def main():
             profile_name = str(settings_snap.get("profile", "general")).strip().lower()
         else:
             profile_name = "general"
+
+    if engine is None:
+        engine = str(getattr(cfg.prefs, "default_stitching_engine", "cielo") or "cielo").strip().lower() or "cielo"
+    if engine not in ENGINES:
+        engine = "cielo"
 
     profile_mapping = {
         "solar": SolarProfile,
@@ -384,6 +403,7 @@ def main():
     print(f"Output path: {output_path}")
 
     cfg.state.cli_mode = True
+    cfg.state.engine = engine
     cfg.state.profile = profile_name
     cfg.state.stitch_mode = stitch_mode
     cfg.state.ssm.grid_cols = cols
@@ -398,6 +418,7 @@ def main():
         cfg.state.psm.set_value("gain_compensation", gain_compensation, profile_name)
 
     print(f"\nProfile: {profile_name}")
+    print(f"Engine: {engine}")
     print(f"Stitch mode: {stitch_mode}")
     print("Resolve parameters: ", "yes" if resolve or stitch_mode == "auto" else "no")
 
@@ -413,7 +434,15 @@ def main():
             subject=profile_name,
             panel_w=panel_w,
             panel_h=panel_h,
+            panel_count=len(items),
+            fpx_mode=str(getattr(cfg.state.ssm, "fpx_mode", "") or ""),
+            focal_length_mm=float(getattr(cfg.state.ssm, "focal_length_mm", 0.0) or 0.0),
+            sensor_width_mm=float(getattr(cfg.state.ssm, "sensor_width_mm", 0.0) or 0.0),
+            sensor_height_mm=float(getattr(cfg.state.ssm, "sensor_height_mm", 0.0) or 0.0),
+            hfov_deg=float(getattr(cfg.state.ssm, "hfov_deg", 0.0) or 0.0),
+            camera_angle_deg=float(getattr(cfg.state.ssm, "camera_angle_deg", 0.0) or 0.0),
             stitch_mode=stitch_mode,
+            # projection_mode=None,
             mount_precision=str(getattr(cfg.state.ssm, "mount_precision", "normal") or "normal"),
             bit_depth=input_bit_depth,
             overlap_x_pct=overlap_x_pct,
@@ -427,6 +456,9 @@ def main():
         for attr, val in resolved.items():
             if hasattr(profile, attr):
                 setattr(profile, attr, val)
+                cfg.state.psm.set_value(attr, val, profile_name)
+            elif hasattr(cfg.state.ssm, attr):
+                cfg.state.ssm.set_value(attr, val)
 
         print("\nSettings parameters:")
         for k in vars(type(profile)):
@@ -443,13 +475,12 @@ def main():
     else:
         engine = GridMode(profile, grid_cols=cols)
 
-    print("Stitching...")
     # Enable panel-placement messages for the CLI progress callback.
     cfg.allowed_message_colors.add("panel")
 
     def _cli_progress_cb(msg: str, color: str = "") -> None:
         c = str(color or "").strip().lower()
-        if c not in DEFAULT_MESSAGE_COLORS:
+        if c not in DEFAULT_MESSAGE_COLORS_STR:
             return
         prefix = {
             "red": "[!] ",

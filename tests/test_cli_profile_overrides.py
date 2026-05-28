@@ -54,8 +54,13 @@ class _DummyEngine:
         type(self).captured = {
             "profile_blend_type": getattr(profile, "blend_type", None),
             "profile_gain_compensation": getattr(profile, "gain_compensation", None),
+            "profile_transform_mode": getattr(profile, "transform_mode", None),
+            "profile_photometric_min_overlap_px": getattr(profile, "photometric_min_overlap_px", None),
             "psm_blend_type": cfg.state.psm.blend_type,
             "psm_gain_compensation": cfg.state.psm.gain_compensation,
+            "ssm_enable_grid_nominal_fallback": cfg.state.ssm.enable_grid_nominal_fallback,
+            "ssm_staged_matching_mode": cfg.state.ssm.staged_matching_mode,
+            "ssm_refs_per_stage": cfg.state.ssm.refs_per_stage,
             "grid_cols": grid_cols,
         }
 
@@ -97,7 +102,7 @@ def test_cli_profile_overrides_sync_to_runtime_state(monkeypatch):
 def test_parse_cli_args_resolve_flag():
     parsed = cli._parse_cli_args(["input_dir", "--resolve"])
     assert parsed is not None
-    (_, _, _, _, _, _, _, _, _, _, settings_file, resolve) = parsed
+    (_, _, _, _, _, _, _, _, _, _, _, settings_file, resolve) = parsed
     assert resolve is True
     assert settings_file is None
 
@@ -112,7 +117,7 @@ def test_parse_cli_args_resolve_short_flag():
 def test_parse_cli_args_load_settings_flag():
     parsed = cli._parse_cli_args(["input_dir", "--load-settings", "my_settings.json"])
     assert parsed is not None
-    (_, _, _, _, _, _, _, _, _, _, settings_file, resolve) = parsed
+    (_, _, _, _, _, _, _, _, _, _, _, settings_file, resolve) = parsed
     assert settings_file == "my_settings.json"
     assert resolve is False
 
@@ -131,8 +136,9 @@ def test_parse_cli_args_load_settings_short_flag():
 def test_parse_cli_args_sentinel_defaults():
     parsed = cli._parse_cli_args(["input_dir"])
     assert parsed is not None
-    (_, _, profile_name, _, cols, overlap_x, overlap_y, _, _, _, _, _) = parsed
+    (_, _, engine, profile_name, _, cols, overlap_x, overlap_y, _, _, _, _, _) = parsed
     assert profile_name is None
+    assert engine is None
     assert cols is None
     assert overlap_x is None
     assert overlap_y is None
@@ -141,10 +147,24 @@ def test_parse_cli_args_sentinel_defaults():
 def test_parse_cli_args_explicit_cols_and_overlaps():
     parsed = cli._parse_cli_args(["input_dir", "-c", "4", "-x", "0", "-y", "0"])
     assert parsed is not None
-    (_, _, _, _, cols, overlap_x, overlap_y, _, _, _, _, _) = parsed
+    (_, _, _, _, _, cols, overlap_x, overlap_y, _, _, _, _, _) = parsed
     assert cols == 4
     assert overlap_x == 0.0
     assert overlap_y == 0.0
+
+
+def test_parse_cli_args_engine_flag():
+    parsed = cli._parse_cli_args(["input_dir", "--engine", "simple"])
+    assert parsed is not None
+    engine = parsed[2]
+    assert engine == "simple"
+
+
+def test_parse_cli_args_engine_short_flag():
+    parsed = cli._parse_cli_args(["input_dir", "-e", "auto"])
+    assert parsed is not None
+    engine = parsed[2]
+    assert engine == "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +288,19 @@ def test_cli_settings_file_profile_used_when_no_cli_profile(monkeypatch, tmp_pat
     cli.main()
 
     assert captured["profile_type"] == "LunarProfile"
+
+
+def test_cli_engine_flag_updates_runtime_state(monkeypatch):
+    _reset_state(monkeypatch)
+    _patch_io(monkeypatch)
+    monkeypatch.setattr(cli, "FreeMode", _DummyEngine)
+    monkeypatch.setattr(cli, "compute_resolved_params", lambda ri: {})
+
+    argv = ["input_dir", "--engine", "simple", "--stitch-mode", "freeform"]
+    monkeypatch.setattr(cli.sys, "argv", ["cielostitch-cli", *argv])
+    cli.main()
+
+    assert cfg.state.engine == "simple"
 
 
 def test_cli_explicit_profile_overrides_settings_file(monkeypatch, tmp_path):
@@ -422,6 +455,35 @@ def test_cli_auto_stitch_mode_invokes_resolver(monkeypatch):
     cli.main()
 
     assert len(resolver_calls) == 1
+
+
+def test_cli_resolved_session_fields_apply_to_runtime_state(monkeypatch):
+    _reset_state(monkeypatch)
+    _patch_io(monkeypatch)
+
+    monkeypatch.setattr(
+        cli,
+        "compute_resolved_params",
+        lambda _ri: {
+            "transform_mode": "homography",
+            "photometric_min_overlap_px": 4321,
+            "photometric_full_confidence_px": 54321,
+            "enable_grid_nominal_fallback": False,
+            "staged_matching_mode": "manual",
+            "refs_per_stage": 7,
+        },
+    )
+    monkeypatch.setattr(cli, "FreeMode", _DummyEngine)
+
+    argv = ["input_dir", "--stitch-mode", "freeform", "--resolve"]
+    monkeypatch.setattr(cli.sys, "argv", ["cielostitch-cli", *argv])
+    cli.main()
+
+    assert _DummyEngine.captured["profile_transform_mode"] == "homography"
+    assert _DummyEngine.captured["profile_photometric_min_overlap_px"] == 4321
+    assert _DummyEngine.captured["ssm_enable_grid_nominal_fallback"] is False
+    assert _DummyEngine.captured["ssm_staged_matching_mode"] == "manual"
+    assert _DummyEngine.captured["ssm_refs_per_stage"] == 7
 
 
 def test_cli_freeform_no_resolve_skips_resolver(monkeypatch):

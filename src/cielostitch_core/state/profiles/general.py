@@ -33,6 +33,9 @@ class GeneralProfile:
     adaptive_mb_risk_boost_threshold = 0.45
     adaptive_mb_low_risk_threshold = 0.10
     adaptive_mb_max_boost = 1
+    ghost_guard_enabled = False
+    ghost_guard_risk_threshold = 0.55
+    ghost_guard_feather_px = 20 # 18
     # Enable additive offset matching across overlap to reduce residual steps.
     blend_offset_match = True
     # Clamp for offset magnitude to bound correction.
@@ -63,5 +66,5 @@ class GeneralProfile:
     # Absolute minimum inlier count; guards against tiny, unreliable solves; unused in forced layout.
     min_inliers = 8
     # Prohibit rotation in transform solve when True; stabilizes grid mosaics on tracking mounts.
-    lock_rotation = True
-
+    # Transform model for feature matching: 'auto', 'affine', 'homography', 'translation'
+    transform_mode = "affine"

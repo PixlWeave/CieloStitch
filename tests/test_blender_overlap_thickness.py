@@ -466,9 +466,28 @@ def test_adaptive_multiband_levels_consider_seam_risk() -> None:
     levels_low = blender._compute_adaptive_levels(overlap, canvas=canvas, img=img_low_risk)
     levels_high = blender._compute_adaptive_levels(overlap, canvas=canvas, img=img_high_risk)
 
-    assert 3 <= levels_low <= Blender.MAX_MULTIBAND_LEVELS
-    assert 3 <= levels_high <= Blender.MAX_MULTIBAND_LEVELS
+    assert 2 <= levels_low <= 5
+    assert 2 <= levels_high <= 5
     assert levels_high >= levels_low
+
+
+def test_adaptive_multiband_levels_fallback_to_two_when_overlap_thickness_missing() -> None:
+    blender = _make_blender(blend_type="adaptive-multiband", multiband_levels=5)
+
+    levels = blender._compute_adaptive_levels(np.zeros((32, 32), dtype=bool))
+
+    assert levels == 2
+
+
+def test_adaptive_feather_uses_configured_base_radius_for_wide_overlap() -> None:
+    blender = _make_blender(blend_type="adaptive-feather")
+    blender.feather_px = 40
+    overlap = np.zeros((160, 160), dtype=bool)
+    overlap[:, 20:140] = True
+
+    feather = blender.get_effective_feather_radius(overlap)
+
+    assert feather == 40
 
 
 def test_adaptive_multiband_levels_respect_configured_risk_knobs(monkeypatch) -> None:
@@ -506,6 +525,315 @@ def test_adaptive_multiband_levels_respect_configured_risk_knobs(monkeypatch) ->
     assert suppressed_by_max_boost == 4
 
 
+def test_ghost_guard_routes_multiband_to_fallback_on_high_risk(monkeypatch) -> None:
+    blender = Blender(
+        feather_px=40,
+        gain_method="median",
+        gain_clamp=(0.85, 1.15),
+        blend_type="multiband",
+        multiband_levels=5,
+        seamless_quality="balanced",
+        lum_only_gain=False,
+        histogram_matching=False,
+        ghost_guard_enabled=True,
+        ghost_guard_risk_threshold=0.40,
+        ghost_guard_feather_px=12,
+    )
+
+    canvas = np.zeros((64, 64), dtype=np.float32)
+    img = np.ones((64, 64), dtype=np.float32)
+    canvas_mask = np.zeros((64, 64), dtype=bool)
+    img_mask = np.zeros((64, 64), dtype=bool)
+    canvas_mask[:, :40] = True
+    img_mask[:, 24:] = True
+
+    calls = {"content_aware": 0, "multiband": 0}
+
+    monkeypatch.setattr(blender, "_compute_overlap_seam_risk", lambda *_args, **_kwargs: 0.9)
+
+    def _fake_content_aware(canvas_in, img_in, canvas_mask_in, img_mask_in, overlap_in, blended_mask=None, seam_heatmap=None):
+        del blended_mask, seam_heatmap
+        calls["content_aware"] += 1
+        assert np.any(overlap_in)
+        return canvas_in
+
+    def _fake_multiband(*_args, **_kwargs):
+        calls["multiband"] += 1
+        return canvas
+
+    monkeypatch.setattr(blender, "_content_aware_feather_blend", _fake_content_aware)
+    monkeypatch.setattr(blender, "_multiband_blend_roi", _fake_multiband)
+
+    blender.blend(canvas, canvas_mask, img, img_mask, use_gain=False)
+
+    assert calls["content_aware"] == 1
+    assert calls["multiband"] == 0
+
+
+def test_ghost_guard_allows_multiband_when_risk_is_low(monkeypatch) -> None:
+    blender = Blender(
+        feather_px=40,
+        gain_method="median",
+        gain_clamp=(0.85, 1.15),
+        blend_type="multiband",
+        multiband_levels=5,
+        seamless_quality="balanced",
+        lum_only_gain=False,
+        histogram_matching=False,
+        ghost_guard_enabled=True,
+        ghost_guard_risk_threshold=0.40,
+        ghost_guard_feather_px=12,
+    )
+
+    canvas = np.zeros((64, 64), dtype=np.float32)
+    img = np.ones((64, 64), dtype=np.float32)
+    canvas_mask = np.zeros((64, 64), dtype=bool)
+    img_mask = np.zeros((64, 64), dtype=bool)
+    canvas_mask[:, :40] = True
+    img_mask[:, 24:] = True
+
+    calls = {"fallback": 0, "multiband": 0}
+
+    monkeypatch.setattr(blender, "_compute_overlap_seam_risk", lambda *_args, **_kwargs: 0.1)
+
+    def _fake_fallback(canvas_in, *_args, **_kwargs):
+        calls["fallback"] += 1
+        return canvas_in
+
+    def _fake_multiband(canvas_in, *_args, **_kwargs):
+        calls["multiband"] += 1
+        return canvas_in
+
+    monkeypatch.setattr(blender, "_fallback_feather_blend", _fake_fallback)
+    monkeypatch.setattr(blender, "_multiband_blend_roi", _fake_multiband)
+
+    blender.blend(canvas, canvas_mask, img, img_mask, use_gain=False)
+
+    assert calls["fallback"] == 0
+    assert calls["multiband"] == 1
+
+
+def test_ghost_guard_feather_mode_uses_legacy_fallback_on_high_risk(monkeypatch) -> None:
+    blender = Blender(
+        feather_px=40,
+        gain_method="median",
+        gain_clamp=(0.85, 1.15),
+        blend_type="multiband",
+        multiband_levels=5,
+        seamless_quality="balanced",
+        lum_only_gain=False,
+        histogram_matching=False,
+        ghost_guard_enabled=True,
+        ghost_guard_mode="feather",
+        ghost_guard_risk_threshold=0.40,
+        ghost_guard_feather_px=12,
+    )
+
+    canvas = np.zeros((64, 64), dtype=np.float32)
+    img = np.ones((64, 64), dtype=np.float32)
+    canvas_mask = np.zeros((64, 64), dtype=bool)
+    img_mask = np.zeros((64, 64), dtype=bool)
+    canvas_mask[:, :40] = True
+    img_mask[:, 24:] = True
+
+    calls = {"fallback": 0, "content_aware": 0}
+
+    monkeypatch.setattr(blender, "_compute_overlap_seam_risk", lambda *_args, **_kwargs: 0.9)
+
+    def _fake_fallback(canvas_in, img_in, canvas_mask_in, img_mask_in, overlap_in, blended_mask_in=None):
+        calls["fallback"] += 1
+        assert np.any(overlap_in)
+        return canvas_in
+
+    def _fake_content_aware(*_args, **_kwargs):
+        calls["content_aware"] += 1
+        return canvas
+
+    monkeypatch.setattr(blender, "_fallback_feather_blend", _fake_fallback)
+    monkeypatch.setattr(blender, "_content_aware_feather_blend", _fake_content_aware)
+
+    blender.blend(canvas, canvas_mask, img, img_mask, use_gain=False)
+
+    assert calls["fallback"] == 1
+    assert calls["content_aware"] == 0
+
+
+def test_ghost_guard_routes_adaptive_feather_to_fallback_on_high_risk(monkeypatch) -> None:
+    blender = Blender(
+        feather_px=40,
+        gain_method="median",
+        gain_clamp=(0.85, 1.15),
+        blend_type="adaptive-feather",
+        multiband_levels=5,
+        seamless_quality="balanced",
+        lum_only_gain=False,
+        histogram_matching=False,
+        ghost_guard_enabled=True,
+        ghost_guard_risk_threshold=0.40,
+        ghost_guard_feather_px=12,
+    )
+
+    canvas = np.zeros((64, 64), dtype=np.float32)
+    img = np.ones((64, 64), dtype=np.float32)
+    canvas_mask = np.zeros((64, 64), dtype=bool)
+    img_mask = np.zeros((64, 64), dtype=bool)
+    canvas_mask[:, :40] = True
+    img_mask[:, 24:] = True
+
+    calls = {"content_aware": 0, "adaptive_feather": 0}
+
+    monkeypatch.setattr(blender, "_compute_overlap_seam_risk", lambda *_args, **_kwargs: 0.9)
+
+    def _fake_content_aware(canvas_in, img_in, canvas_mask_in, img_mask_in, overlap_in, blended_mask=None, seam_heatmap=None):
+        del blended_mask, seam_heatmap
+        calls["content_aware"] += 1
+        assert np.any(overlap_in)
+        return canvas_in
+
+    def _fake_adaptive_feather(*_args, **_kwargs):
+        calls["adaptive_feather"] += 1
+        return canvas
+
+    monkeypatch.setattr(blender, "_content_aware_feather_blend", _fake_content_aware)
+    monkeypatch.setattr(blender, "_adaptive_feather_blend", _fake_adaptive_feather)
+
+    blender.blend(canvas, canvas_mask, img, img_mask, use_gain=False)
+
+    assert calls["content_aware"] == 1
+    assert calls["adaptive_feather"] == 0
+
+
+def test_ghost_guard_routes_to_content_aware_seam_fallback_on_high_risk(monkeypatch) -> None:
+    blender = Blender(
+        feather_px=40,
+        gain_method="median",
+        gain_clamp=(0.85, 1.15),
+        blend_type="multiband",
+        multiband_levels=5,
+        seamless_quality="balanced",
+        lum_only_gain=False,
+        histogram_matching=False,
+        ghost_guard_enabled=True,
+        ghost_guard_risk_threshold=0.40,
+        ghost_guard_feather_px=12,
+    )
+
+    canvas = np.zeros((64, 64), dtype=np.float32)
+    img = np.ones((64, 64), dtype=np.float32)
+    canvas_mask = np.zeros((64, 64), dtype=bool)
+    img_mask = np.zeros((64, 64), dtype=bool)
+    canvas_mask[:, :40] = True
+    img_mask[:, 24:] = True
+
+    calls = {"content_aware": 0, "multiband": 0}
+
+    monkeypatch.setattr(blender, "_compute_overlap_seam_risk", lambda *_args, **_kwargs: 0.9)
+
+    def _fake_content_aware(canvas_in, img_in, canvas_mask_in, img_mask_in, overlap_in, blended_mask=None, seam_heatmap=None):
+        del img_in, canvas_mask_in, img_mask_in, blended_mask, seam_heatmap
+        calls["content_aware"] += 1
+        assert np.any(overlap_in)
+        return canvas_in
+
+    def _fake_multiband(*_args, **_kwargs):
+        calls["multiband"] += 1
+        return canvas
+
+    monkeypatch.setattr(blender, "_content_aware_feather_blend", _fake_content_aware)
+    monkeypatch.setattr(blender, "_multiband_blend_roi", _fake_multiband)
+
+    blender.blend(canvas, canvas_mask, img, img_mask, use_gain=False)
+
+    assert calls["content_aware"] == 1
+    assert calls["multiband"] == 0
+
+
+def test_ghost_guard_logs_selected_mode_and_risk(monkeypatch) -> None:
+    blender = Blender(
+        feather_px=40,
+        gain_method="median",
+        gain_clamp=(0.85, 1.15),
+        blend_type="multiband",
+        multiband_levels=5,
+        seamless_quality="balanced",
+        lum_only_gain=False,
+        histogram_matching=False,
+        ghost_guard_enabled=True,
+        ghost_guard_mode="content-aware",
+        ghost_guard_risk_threshold=0.40,
+        ghost_guard_feather_px=12,
+    )
+
+    canvas = np.zeros((64, 64), dtype=np.float32)
+    img = np.ones((64, 64), dtype=np.float32)
+    canvas_mask = np.zeros((64, 64), dtype=bool)
+    img_mask = np.zeros((64, 64), dtype=bool)
+    canvas_mask[:, :40] = True
+    img_mask[:, 24:] = True
+
+    debug_messages = []
+
+    monkeypatch.setattr(blender, "_compute_overlap_seam_risk", lambda *_args, **_kwargs: 0.9)
+    monkeypatch.setattr(
+        "cielostitch_core.core.blender.logger.debug",
+        lambda msg, *args: debug_messages.append(msg % args if args else msg),
+    )
+    monkeypatch.setattr(
+        blender,
+        "_content_aware_feather_blend",
+        lambda canvas_in, *_args, **_kwargs: canvas_in,
+    )
+
+    blender.blend(canvas, canvas_mask, img, img_mask, use_gain=False)
+
+    assert any("ghost_guard triggered" in message for message in debug_messages)
+    assert any("blend_type=multiband" in message for message in debug_messages)
+    assert any("mode=content-aware" in message for message in debug_messages)
+
+
+def test_ghost_guard_feather_mode_logs_legacy_fallback(monkeypatch) -> None:
+    blender = Blender(
+        feather_px=40,
+        gain_method="median",
+        gain_clamp=(0.85, 1.15),
+        blend_type="multiband",
+        multiband_levels=5,
+        seamless_quality="balanced",
+        lum_only_gain=False,
+        histogram_matching=False,
+        ghost_guard_enabled=True,
+        ghost_guard_mode="feather",
+        ghost_guard_risk_threshold=0.40,
+        ghost_guard_feather_px=12,
+    )
+
+    canvas = np.zeros((64, 64), dtype=np.float32)
+    img = np.ones((64, 64), dtype=np.float32)
+    canvas_mask = np.zeros((64, 64), dtype=bool)
+    img_mask = np.zeros((64, 64), dtype=bool)
+    canvas_mask[:, :40] = True
+    img_mask[:, 24:] = True
+
+    debug_messages = []
+
+    monkeypatch.setattr(blender, "_compute_overlap_seam_risk", lambda *_args, **_kwargs: 0.9)
+    monkeypatch.setattr(
+        "cielostitch_core.core.blender.logger.debug",
+        lambda msg, *args: debug_messages.append(msg % args if args else msg),
+    )
+    monkeypatch.setattr(
+        blender,
+        "_fallback_feather_blend",
+        lambda canvas_in, *_args, **_kwargs: canvas_in,
+    )
+
+    blender.blend(canvas, canvas_mask, img, img_mask, use_gain=False)
+
+    assert any("ghost_guard triggered" in message for message in debug_messages)
+    assert any("ghost_guard fallback applied" in message for message in debug_messages)
+    assert any("blend_type=multiband ghost_guard_mode=feather" in message for message in debug_messages)
+
+
 @pytest.mark.parametrize(
     "field_name",
     [
@@ -514,6 +842,8 @@ def test_adaptive_multiband_levels_respect_configured_risk_knobs(monkeypatch) ->
         "adaptive_mb_max_boost",
         "photometric_min_overlap_px",
         "photometric_full_confidence_px",
+        "ghost_guard_risk_threshold",
+        "ghost_guard_feather_px",
     ],
 )
 def test_blender_init_rejects_invalid_numeric_knobs(field_name: str) -> None:
@@ -531,6 +861,9 @@ def test_blender_init_rejects_invalid_numeric_knobs(field_name: str) -> None:
         adaptive_mb_max_boost=1,
         photometric_min_overlap_px=2_000,
         photometric_full_confidence_px=250_000,
+        ghost_guard_enabled=False,
+        ghost_guard_risk_threshold=0.55,
+        ghost_guard_feather_px=18,
     )
     kwargs[field_name] = "invalid"
 
@@ -544,6 +877,7 @@ def test_blender_init_rejects_invalid_numeric_knobs(field_name: str) -> None:
         "adaptive_mb_max_boost",
         "photometric_min_overlap_px",
         "photometric_full_confidence_px",
+        "ghost_guard_feather_px",
     ],
 )
 def test_blender_init_rejects_non_integral_numeric_for_integer_knobs(field_name: str) -> None:
@@ -561,8 +895,36 @@ def test_blender_init_rejects_non_integral_numeric_for_integer_knobs(field_name:
         adaptive_mb_max_boost=1,
         photometric_min_overlap_px=2_000,
         photometric_full_confidence_px=250_000,
+        ghost_guard_enabled=False,
+        ghost_guard_risk_threshold=0.55,
+        ghost_guard_feather_px=18,
     )
     kwargs[field_name] = 1.9
 
     with pytest.raises(ValueError, match=f"Invalid value for '{field_name}'"):
         Blender(**kwargs)
+
+
+def test_blender_init_coalesces_none_for_ghost_guard_numeric_knobs() -> None:
+    blender = Blender(
+        feather_px=40,
+        gain_method="median",
+        gain_clamp=(0.85, 1.15),
+        blend_type="seamless",
+        multiband_levels=5,
+        seamless_quality="balanced",
+        lum_only_gain=False,
+        histogram_matching=False,
+        adaptive_mb_risk_boost_threshold=0.45,
+        adaptive_mb_low_risk_threshold=0.10,
+        adaptive_mb_max_boost=1,
+        photometric_min_overlap_px=2_000,
+        photometric_full_confidence_px=250_000,
+        ghost_guard_enabled=True,
+        ghost_guard_risk_threshold=None,
+        ghost_guard_feather_px=None,
+    )
+
+    assert blender.ghost_guard_enabled is True
+    assert blender.ghost_guard_risk_threshold == pytest.approx(0.55)
+    assert blender.ghost_guard_feather_px == 20

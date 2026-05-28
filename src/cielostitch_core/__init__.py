@@ -7,7 +7,7 @@
 # Licensed under the MIT License.
 # See the LICENSE file for details.
 
-__version__ = "0.4.50"
+__version__ = "0.5.00"
 __author__ = "Debasish Saha"
 __email__ = "dcsaha@gmail.com"
 __status__ = "Development"

@@ -7,8 +7,9 @@
 # See the LICENSE file for details.
 
 import numpy as np
+from types import SimpleNamespace
 
-from cielostitch_core.core.stitching.base_mode import BaseStitchMode
+from cielostitch_core.stitching.base_mode import BaseStitchMode
 from cielostitch_core.state.preferences import AppPreferences
 
 
@@ -103,3 +104,40 @@ def test_subpixel_refinement_uses_geometric_support_not_signal_threshold(monkeyp
     assert metrics is not None
     assert metrics["applied"] is True
     np.testing.assert_allclose(refined, np.eye(3, dtype=np.float64))
+
+
+def test_match_feature_pair_skips_subpixel_refinement_for_homography(monkeypatch):
+    mode = object.__new__(BaseStitchMode)
+    mode.profile = SimpleNamespace(transform_mode="homography")
+    mode.matcher = SimpleNamespace(
+        match=lambda *_args, **_kwargs: [SimpleNamespace(queryIdx=0, trainIdx=0, distance=0.0)],
+        compute_transform=lambda *_args, **_kwargs: (np.eye(3, dtype=np.float64), np.ones(1, dtype=bool)),
+        describe_pair_evidence=lambda metrics: metrics,
+    )
+    mode._record_phase_time = lambda *_args, **_kwargs: None
+
+    called = {"count": 0}
+
+    def fake_refine(*_args, **_kwargs):
+        called["count"] += 1
+        return np.eye(3, dtype=np.float64), {"applied": True, "response": 1.0, "dx": 0.0, "dy": 0.0}
+
+    monkeypatch.setattr(mode, "_refine_transform_with_phase_correlation", fake_refine)
+
+    ref_keypoints = [SimpleNamespace(pt=(0.0, 0.0))]
+    current_keypoints = [SimpleNamespace(pt=(0.0, 0.0))]
+    local_transform, inlier_mask, feature_metrics = mode._match_feature_pair_with_metrics(
+        ref_keypoints,
+        np.ones((1, 8), dtype=np.float32),
+        1.0,
+        current_keypoints,
+        np.ones((1, 8), dtype=np.float32),
+        1.0,
+        ref_image=np.zeros((64, 64), dtype=np.float32),
+        current_image=np.zeros((64, 64), dtype=np.float32),
+    )
+
+    assert called["count"] == 0
+    assert local_transform is not None
+    assert inlier_mask is not None
+    assert feature_metrics.get("subpixel_refinement_applied", False) is False

@@ -12,8 +12,8 @@ from dataclasses import replace
 import numpy as np
 
 from cielostitch_core.config.config import cfg
-from cielostitch_core.core.stitching.free_mode import FreeMode
-from cielostitch_core.core.stitching.grid_mode import GridMode
+from cielostitch_core.stitching.free_mode import FreeMode
+from cielostitch_core.stitching.grid_mode import GridMode
 from cielostitch_core.state.profiles import GeneralProfile
 
 

@@ -41,3 +41,12 @@ def first_part(s: str, n: int) -> str:
     if n <= 3:
         return "." * n
     return f"{s[:(n-3)]}..."
+
+
+def first_and_last_part(s: str, n: int) -> str:
+    if len(s) <= n:
+        return s
+    if n <= 3:
+        return "." * n
+    part_len = (n - 3) // 2
+    return s[:part_len] + " ... " + s[-part_len:]

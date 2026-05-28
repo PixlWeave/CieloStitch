@@ -55,8 +55,9 @@ class MilkyWayProfile:
     min_inlier_ratio = 0.12
     min_inliers = 16
     # Prohibit rotation in transform solve when True; stabilizes grid mosaics on tracking mounts.
-    lock_rotation = False
-
+    # Transform model for feature matching: 'auto', 'affine', 'homography', 'translation'
+    transform_mode = "affine"
+    
     # --- Additional processing ---
     # Flatten to suppress airglow/LP gradients
     enable_panel_flatten = True

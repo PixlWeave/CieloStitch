@@ -21,6 +21,10 @@ class IlluminationNormalizer:
             min_overlap_px=2_000,
             full_confidence_px=250_000
     ):
+        # Shape check: all inputs must have the same shape in the first two dimensions
+        if canvas.shape[:2] != warped.shape[:2] or canvas.shape[:2] != overlap_mask.shape[:2]:
+            raise ValueError("canvas, warped, and overlap_mask must have the same spatial shape")
+
         overlap_mask = overlap_mask.astype(bool)
         count = np.count_nonzero(overlap_mask)
         if count < min_overlap_px:
